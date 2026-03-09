@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Stock Advisor - 毎日株価ダッシュボード</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #3b82f6;
+            --accent-glow: rgba(59, 130, 246, 0.5);
+            --danger: #ef4444;
+            --danger-glow: rgba(239, 68, 68, 0.3);
+            --success: #10b981;
+            --success-glow: rgba(16, 185, 129, 0.3);
+            --border: rgba(255, 255, 255, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Inter', 'Noto Sans JP', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            background-image: 
+                radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.15) 0%, transparent 50%),
+                radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.1) 0%, transparent 50%);
+            background-attachment: fixed;
+            padding-bottom: 40px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 30px 0;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 30px;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #60a5fa, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        .date {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        /* Summary Section */
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 40px;
+        }
+
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .card-title {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .card-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+        }
+
+        .value-danger {
+            color: var(--danger);
+            text-shadow: 0 0 10px var(--danger-glow);
+        }
+
+        .value-success {
+            color: var(--success);
+            text-shadow: 0 0 10px var(--success-glow);
+        }
+
+        /* Stock Details */
+        .section-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .section-title::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 20px;
+            background: var(--accent);
+            border-radius: 2px;
+            box-shadow: 0 0 10px var(--accent-glow);
+        }
+
+        .stock-list {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .stock-item {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .stock-item:hover {
+            border-color: rgba(255, 255, 255, 0.2);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+
+        .stock-header {
+            padding: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.02);
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .stock-name-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .stock-name {
+            font-size: 1.3rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .stock-code {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 2px 8px;
+            border-radius: 12px;
+            display: inline-block;
+            width: fit-content;
+        }
+
+        .stock-metrics {
+            text-align: right;
+        }
+
+        .stock-price {
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .stock-pl {
+            font-size: 0.95rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 5px;
+        }
+
+        .pl-down { color: var(--danger); }
+        .pl-up { color: var(--success); }
+
+        .stock-body {
+            padding: 20px;
+        }
+
+        .deadline-alert {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            padding: 12px 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #fca5a5;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .ai-advice {
+            background: rgba(59, 130, 246, 0.05);
+            border-left: 3px solid var(--accent);
+            padding: 15px 20px;
+            border-radius: 0 8px 8px 0;
+            margin-bottom: 20px;
+        }
+
+        .ai-advice-title {
+            color: #93c5fd;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .ai-advice-title svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .ai-advice-text {
+            font-size: 0.95rem;
+            line-height: 1.6;
+            color: #e2e8f0;
+        }
+
+        .ai-advice-text strong {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 0 4px;
+            border-radius: 4px;
+        }
+
+        .news-section {
+            margin-top: 20px;
+        }
+
+        .news-title {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .news-list {
+            list-style: none;
+        }
+
+        .news-list li {
+            font-size: 0.9rem;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: #cbd5e1;
+        }
+
+        .news-list li:last-child {
+            border-bottom: none;
+        }
+
+        .news-list li::before {
+            content: '•';
+            color: var(--accent);
+            margin-right: 8px;
+        }
+
+        /* Mobile Adjustments */
+        @media (max-width: 600px) {
+            .stock-header {
+                flex-direction: column;
+                gap: 10px;
+            }
+            .stock-metrics {
+                text-align: left;
+                width: 100%;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <div class="logo">AI Stock Advisor</div>
+        <div class="date">2026年2月25日 更新</div>
+    </header>
+
+    <div class="summary-cards">
+        <div class="card">
+            <div class="card-title">信用評価損益額</div>
+            <div class="card-value value-danger">-1,557,197<span style="font-size:1rem;font-weight:500;margin-left:4px;">円</span></div>
+        </div>
+        <div class="card">
+            <div class="card-title">保証金維持率</div>
+            <div class="card-value">36.42<span style="font-size:1rem;font-weight:500;margin-left:4px;">%</span></div>
+        </div>
+    </div>
+
+    <h2 class="section-title">AI 分析レポート（保有銘柄）</h2>
+
+    <div class="stock-list">
+        <!-- Stock Item: SONY -->
+        <div class="stock-item">
+            <div class="stock-header">
+                <div class="stock-name-group">
+                    <div class="stock-name">ソニーグループ</div>
+                    <div class="stock-code">6758 (買建 1,500株)</div>
+                </div>
+                <div class="stock-metrics">
+                    <div class="stock-price">3,336.0 円</div>
+                    <div class="stock-pl pl-down">
+                        ▼ -1,463,140 円 (-22.79%)
+                    </div>
+                </div>
+            </div>
+            <div class="stock-body">
+                <div class="deadline-alert">
+                    <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                    返済期日: 4月7日（残り約40日）- 注意が必要です
+                </div>
+
+                <div class="ai-advice">
+                    <div class="ai-advice-title">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        本日のAIアドバイス
+                    </div>
+                    <div class="ai-advice-text">
+                        業績は好調ですが、日経平均に連動して上値が重い展開です。<strong>期日（4月7日）が迫っていることが最大のリスク</strong>です。<br><br>
+                        【戦略】3,500円〜3,800円の抵抗帯まで反発した際は、損失を確定させてでも<strong>300株ずつ段階的に売却してポジションを縮小</strong>することを強く推奨します。3月下旬にパニック売りを避けるため、今から出口戦略を持っておくべきです。
+                    </div>
+                </div>
+
+                <div class="news-section">
+                    <div class="news-title">最新ニュース＆需給データ</div>
+                    <ul class="news-list">
+                        <li>信用倍率: 31.58倍 (売り残: 45.2万株 / 買い残: 1449.1万株)</li>
+                        <li>アナリスト評価は「強気買い」（目標株価約4,969円）</li>
+                        <li>PlayStation Networkのアクティブユーザー数が過去最高を記録</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Stock Item: MITSUBISHI -->
+        <div class="stock-item" style="border-color: rgba(16, 185, 129, 0.3);">
+            <div class="stock-header">
+                <div class="stock-name-group">
+                    <div class="stock-name">三菱商事</div>
+                    <div class="stock-code">8058 (買建 100株)</div>
+                </div>
+                <div class="stock-metrics">
+                    <div class="stock-price">4,991.0 円</div>
+                    <div class="stock-pl pl-up">
+                        ▲ +126,681 円 (+34.23%)
+                    </div>
+                </div>
+            </div>
+            <div class="stock-body">
+                <div class="ai-advice">
+                    <div class="ai-advice-title" style="color: #6ee7b7; border-color: var(--success);">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        本日のAIアドバイス
+                    </div>
+                    <div class="ai-advice-text">
+                        強固なファンダメンタルズを背景に堅調な推移が続いています。含み益が乗っており、返済期日（5月27日）にもまだ余裕があります。<br><br>
+                        【戦略】<strong>現状維持（ホールド）</strong>で問題ありません。ソニーグループなどのマイナスを補填する「利益のクッション」として機能しています。当面は5,000円台定着を目指す展開が予想されます。
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+    </div>
+</div>
+
+</body>
+</html>

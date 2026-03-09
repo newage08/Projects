@@ -1,0 +1,12 @@
+# Media
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.assets
+Assets.xcassets/
+
+# Build artifacts
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/

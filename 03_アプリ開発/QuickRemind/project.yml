@@ -1,0 +1,21 @@
+name: QuickRemind
+options:
+  bundleIdPrefix: com.example.reminderapp
+targets:
+  QuickRemind:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: "俺のリマインダー"
+        NSRemindersUsageDescription: "アプリ内でリマインダーを登録・管理するためにアクセスが必要です。"
+        NSRemindersFullAccessUsageDescription: "素早く一覧を表示・登録するためにリマインダーのフルアクセス許可が必要です。"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        CFBundleIconName: AppIcon
+        CFBundleIconFile: AppIcon

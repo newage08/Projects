@@ -1,0 +1,21 @@
+name: SmartCalendar
+options:
+  bundleIdPrefix: com.example.smartcalendar
+targets:
+  SmartCalendar:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - Sources
+    info:
+      path: Info.plist
+      properties:
+        NSCalendarsUsageDescription: "カレンダーにイベントを追加・管理するために必要です。"
+        NSCalendarsFullAccessUsageDescription: "すべてのカレンダーを読み書きするために必要です。"
+        NSRemindersUsageDescription: "リマインダーをカレンダー内に表示するために必要です。"
+        NSRemindersFullAccessUsageDescription: "すべてのリマインダーを読み書きするために必要です。"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        CFBundleIconName: AppIcon

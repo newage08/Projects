@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.youtube.com)",
+      "WebSearch",
+      "Bash(python3 -c \"import sys,json; print\\(json.dumps\\(json.load\\(sys.stdin\\), indent=2, ensure_ascii=False\\)\\)\")",
+      "Bash(curl -s \"https://api.notion.com/v1/pages/31d1e89228bf80fa9d8ffeacd3dc3b9d\" -H \"Authorization: Bearer ntn_D81968600957bzPBdoE0RvPyas3hB0CASKfi5ELVc0eaaR\" -H \"Notion-Version: 2022-06-28\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(d.get\\(''object''\\), d.get\\(''id'',''''\\), d.get\\(''properties'',{}\\).get\\(''title'',{}\\).get\\(''title'',[{}]\\)[0].get\\(''plain_text'',''???''\\)\\)\")",
+      "Bash(chmod +x /Users/kazuya/Projects/00_LifeOS/scripts/morning_briefing.py)",
+      "Bash(python3 /Users/kazuya/Projects/00_LifeOS/scripts/morning_briefing.py)",
+      "Bash(crontab -l)",
+      "Bash(crontab -)",
+      "WebFetch(domain:stockscope.app)",
+      "WebFetch(domain:finance.yahoo.co.jp)",
+      "WebFetch(domain:kabutan.jp)",
+      "Bash(osascript -e ':*)",
+      "Bash(xxd /Users/kazuya/Projects/01_株/00_Master.md)",
+      "Bash(git -C /Users/kazuya/Projects/01_株 ls-files 00_Master.md)",
+      "Bash(git -C /Users/kazuya/Projects/01_株 rm 00_Master.md)",
+      "Bash(git -C:*)",
+      "Bash(git -C /Users/kazuya/Projects/01_株 push)",
+      "Bash(gh repo create 04_業務改善 --private --source /Users/kazuya/Projects/04_業務改善 --push)",
+      "Bash(brew list gh)",
+      "Bash(brew install gh)",
+      "Bash(swift build)",
+      "Bash(xcodebuild -project SmartCalendar.xcodeproj -scheme SmartCalendar -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(sudo xcode-select -s /Applications/Xcode.app/Contents/Developer)",
+      "Bash(xcodebuild -project /Users/kazuya/Projects/03_アプリ開発/SmartCalendar/SmartCalendar.xcodeproj -scheme SmartCalendar -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project /Users/kazuya/Projects/03_アプリ開発/SmartCalendar/SmartCalendar.xcodeproj -scheme SmartCalendar -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project /Users/kazuya/Projects/03_アプリ開発/SmartCalendar/SmartCalendar.xcodeproj -scheme SmartCalendar -sdk iphonesimulator build)",
+      "Bash(gh --version)",
+      "Bash(gh auth status)",
+      "Bash(gh auth login --web)",
+      "Bash(xcodebuild -scheme SmartCalendar -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -scheme SmartCalendar -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -scheme SmartCalendar -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build)",
+      "Bash(xcodebuild -project QuickRemind.xcodeproj -scheme QuickRemind -destination \"generic/platform=iOS Simulator\" build)",
+      "Read(//Applications/**)",
+      "Bash(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project /Users/kazuya/Projects/03_アプリ開発/QuickRemind/QuickRemind.xcodeproj -scheme QuickRemind -destination \"generic/platform=iOS Simulator\" build)"
+    ]
+  }
+}
