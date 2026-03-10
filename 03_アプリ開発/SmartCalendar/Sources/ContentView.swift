@@ -35,6 +35,8 @@ struct MainCalendarView: View {
     @State private var inputText = ""
     @State private var liveParsedEvent: ParsedEvent? = nil
     @State private var pendingProgress: Double = 0.0
+    @State private var openedFromInput = false
+    @State private var parseTask: Task<Void, Never>? = nil
     @State private var deletingEvent: CalendarEvent? = nil
     @State private var editingEvent: CalendarEvent? = nil
     @State private var listProxy: ScrollViewProxy? = nil
@@ -50,6 +52,11 @@ struct MainCalendarView: View {
     @AppStorage("searchRangeYears") private var searchRangeYears = 3
     @State private var showSettings = false
     @State private var currentSearchYearsBack = 3
+    // 検索結果の自動スクロール制御用
+    @State private var lastCachedSearchCount = 0
+    @State private var searchTopDate: Date? = nil
+    // 月変更フェッチのキャンセル用タスク
+    @State private var fetchMonthTask: Task<Void, Never>? = nil
 
     var body: some View {
         GeometryReader { _ in
@@ -94,6 +101,7 @@ struct MainCalendarView: View {
                         onSubmit: { openDetailFromInput() },
                         onLongPress: {
                             UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                            openedFromInput = false
                             editingEvent = manager.newEmptyEvent()
                         },
                         onSettingsTap: { showSettings = true }
@@ -112,17 +120,39 @@ struct MainCalendarView: View {
             }
         }
         .sheet(item: $editingEvent, onDismiss: {
+            // シートが閉じたときにリストを再フェッチ
             Task { await manager.fetchEvents(for: manager.displayedMonth) }
+            if openedFromInput {
+                // キャンセルや下スワイプなら入力画面に戻す
+                showInput = true
+            }
+            openedFromInput = false
         }) { ev in
-            EventEditSheet(event: ev).environmentObject(manager)
+            EventEditSheet(event: ev)
+                .environmentObject(manager)
+                // 保存通知を受けて入力欄をクリア
+                .onReceive(NotificationCenter.default.publisher(for: .init("EventSheetDidSaveNew"))) { _ in
+                    inputText = ""
+                    inputSelectedDate = nil
+                    liveParsedEvent = nil
+                    openedFromInput = false
+                }
         }
         .sheet(isPresented: $showSettings) {
             SettingsView().environmentObject(manager)
         }
         .onChange(of: manager.displayedMonth) { newMonth in
-            Task { await manager.fetchEvents(for: newMonth) }
+            // ここのイベント取得は連続して呼ばれると重くなるためタスクをキャンセルしてデバウンス
+            fetchMonthTask?.cancel()
+            fetchMonthTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                guard !Task.isCancelled else { return }
+                await manager.fetchEvents(for: newMonth)
+            }
         }
         .onChange(of: isSearching) { searching in
+            // 検索開始時はカウントをリセット
+            if searching { lastCachedSearchCount = 0 }
             handleSearchToggle(searching: searching)
         }
         .onChange(of: searchText) { query in
@@ -136,10 +166,16 @@ struct MainCalendarView: View {
             }
         }
         .onChange(of: inputText) { newVal in
-            if newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                liveParsedEvent = nil
-            } else {
-                liveParsedEvent = NLPService.shared.parse(text: newVal)
+            // NLP解析もデバウンスしてUIのもたつきを減らす
+            parseTask?.cancel()
+            parseTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                guard !Task.isCancelled else { return }
+                if newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    liveParsedEvent = nil
+                } else {
+                    liveParsedEvent = NLPService.shared.parse(text: newVal)
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .init("OpenDuplicateEvent"))) { notif in
@@ -149,7 +185,6 @@ struct MainCalendarView: View {
             if let d = notif.object as? Date {
                 let day = Calendar.current.startOfDay(for: d)
                 if showInput {
-                    // 入力モード中：日付選択を更新 + リストも連動スクロール + カレンダーを縮小
                     inputSelectedDate = day
                     selectedDate = day
                     selectedDateFromCalendar = day
@@ -175,7 +210,7 @@ struct MainCalendarView: View {
         // カレンダーの表示月を今月に戻す
         if let month = Calendar.current.date(from: Calendar.current.dateComponents([.year, .month], from: today)) {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                manager.displayedMonth = month
+                manager.setDisplayedMonth(month)
             }
         }
         
@@ -186,9 +221,10 @@ struct MainCalendarView: View {
     // MARK: - View Builders
     
     private var headerWatermarkText: String {
+        // 年月表示オフ時のウォーターマーク。年を含めることで文脈を失わない。
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
-        f.dateFormat = "M"
+        f.dateFormat = "yyyy年M月"
         return f.string(from: manager.displayedMonth)
     }
 
@@ -306,45 +342,40 @@ struct MainCalendarView: View {
         }
         .coordinateSpace(name: "scroll")
         .onPreferenceChange(ScrollOffsetKey.self) { offsets in
-            // === リストのスクロール → カレンダーへの反映（単方向同期） ===
-            guard !isSearching else { return }
-            
-            // 初回スクロール（今日へのジャンプ）が完了するまでは、スクロール位置による逆流（過去への無限フェッチ）を防止する
-            guard hasInitiallyScrolled else { return }
-            
-            // ユーザーがカレンダーを操作している最中（ジャンプ命令実行中）はスクロール反映をミュートする
-            guard selectedDateFromCalendar == nil else { return }
-            
-            // 画面上部（Y=0付近）にあるヘッダーを探す。
-            // stickyヘッダーは上端にくっつくとY=0程度になるため、y <= 40の中で最大（一番下寄り、つまり今ちょうどヘッダーになっているもの）を取得する
-            let targetOffsets = offsets.filter { $0.value <= 40 }
-            guard let (date, _) = targetOffsets.max(by: { $0.value < $1.value }) else { return }
-            
             let cal = Calendar.current
-            let newDate = cal.startOfDay(for: date)
-            guard let newMonth = cal.date(from: cal.dateComponents([.year, .month], from: date)) else { return }
-            
-            // リストで「画面上部に今来ている日」をカレンダー側にサイレント反映
-            if manager.displayedMonth != newMonth {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    manager.displayedMonth = newMonth
+            if isSearching {
+                // 検索モードでは、見えている最上部の日付を記録しておく
+                // 値は表示したいヘッダの日付を示す。
+                if let (date, y) = offsets.min(by: { abs($0.value) < abs($1.value) }) {
+                    searchTopDate = date
                 }
-            }
-            if selectedDate != newDate {
-                selectedDate = newDate
+            } else {
+                // === リストのスクロール → カレンダーへの反映（単方向同期） ===
+                // 初回スクロール（今日へのジャンプ）が完了するまでは、スクロール位置による逆流（過去への無限フェッチ）を防止する
+                // ※過去へのスクロールで自動フェッチしないのは仕様（高速スクロール中の予期せぬ読み込みや
+                //   UIフリーズを避けるため）。ユーザーは「さらに過去を読み込む」ボタンで明示的に取得する。
+                guard !isSearching, hasInitiallyScrolled else { return }
+                // ユーザーがカレンダーを操作している最中（ジャンプ命令実行中）はスクロール反映をミュートする
+                guard selectedDateFromCalendar == nil else { return }
+                // 画面上部（Y=0付近）にあるヘッダーを探す。
+                let targetOffsets = offsets.filter { $0.value <= 40 }
+                guard let (date, _) = targetOffsets.max(by: { $0.value < $1.value }) else { return }
+                let newDate = cal.startOfDay(for: date)
+                guard let newMonth = cal.date(from: cal.dateComponents([.year, .month], from: date)) else { return }
+                if manager.displayedMonth != newMonth {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        manager.setDisplayedMonth(newMonth)
+                    }
+                }
+                if selectedDate != newDate {
+                    selectedDate = newDate
+                }
             }
         }
         .onChange(of: selectedDateFromCalendar) { targetDate in
-            // === カレンダー操作 → リストへのジャンプ反映 ===
             guard let targetDate = targetDate, !isSearching else { return }
-            
-            // カレンダー側の青丸も更新する
             if selectedDate != targetDate { selectedDate = targetDate }
-            
-            // リストを対象の日付セクションまでスクロールする
             scrollToSelected(proxy: proxy, targetDate: targetDate, animated: true)
-            
-            // ジャンプ命令を消化したら空に戻し、以後は再びリストのスクロールを正として扱う
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if selectedDateFromCalendar == targetDate {
                     selectedDateFromCalendar = nil
@@ -359,16 +390,27 @@ struct MainCalendarView: View {
             guard isSearching, !searchText.isEmpty else { return }
             cachedSearchResults = buildSearchResults(query: searchText.lowercased())
         }
-        .onChange(of: cachedSearchResults.count) { _ in
-            // 検索結果が変わったら最新（一番下）へスクロール
-            guard isSearching, !cachedSearchResults.isEmpty else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                withAnimation { proxy.scrollTo("search_bottom", anchor: .bottom) }
+        .onChange(of: cachedSearchResults.count) { newCount in
+            guard isSearching, !cachedSearchResults.isEmpty else {
+                lastCachedSearchCount = newCount
+                return
             }
+            if lastCachedSearchCount == 0 {
+                // 初回ロードは下まで飛ばす
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    withAnimation { proxy.scrollTo("search_bottom", anchor: .bottom) }
+                }
+            } else {
+                // 追加読み込み時はトップに記録した日付を復元
+                if let top = searchTopDate {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        withAnimation { proxy.scrollTo("hdr_\(top.timeIntervalSince1970)", anchor: .top) }
+                    }
+                }
+            }
+            lastCachedSearchCount = newCount
         }
         .onChange(of: manager.syncListToMonth) { month in
-            // 月をまたぐスワイプ等があった場合、アニメーションなしで即座にジャンプ
-            // （selectedDateFromCalendar経由のアニメーションスクロールは目障りなため直接呼ぶ）
             guard let month = month, !isSearching else { return }
             if let proxy = listProxy {
                 scrollToSelected(proxy: proxy, targetDate: month, animated: false)
@@ -398,7 +440,7 @@ struct MainCalendarView: View {
             Button {
                 let more = currentSearchYearsBack + 5
                 currentSearchYearsBack = more
-                manager.resetEventCache()
+                // 既存データは保持したまま追加フェッチする
                 Task { await manager.fetchAllEventsForSearch(yearsBack: more) }
             } label: {
                 HStack(spacing: 6) {
@@ -416,7 +458,17 @@ struct MainCalendarView: View {
             }
 
             ForEach(results, id: \.date) { group in
-                Section(header: DateSectionHeader(date: group.date)) {
+                Section(header:
+                    DateSectionHeader(date: group.date)
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: ScrollOffsetKey.self,
+                                    value: [group.date: proxy.frame(in: .named("scroll")).minY]
+                                )
+                            }
+                        )
+                ) {
                     ForEach(group.events) { ev in
                         EventRow(
                             event: ev,
@@ -486,7 +538,7 @@ struct MainCalendarView: View {
 
         let today = Calendar.current.startOfDay(for: Date())
         if let thisMonth = Calendar.current.date(from: Calendar.current.dateComponents([.year, .month], from: today)) {
-            manager.displayedMonth = thisMonth
+            manager.setDisplayedMonth(thisMonth)
         }
 
         // 検索でメモリに溜まったイベントキャッシュを完全クリアして再取得
@@ -542,15 +594,26 @@ struct MainCalendarView: View {
     }
 
     func scrollToSelected(proxy: ScrollViewProxy, targetDate: Date, animated: Bool = true) {
-        // カレンダーで選択された日に最も近い日を探す（該当の「日」がなければ次の日）
+        let cal = Calendar.current
+        let day = cal.startOfDay(for: targetDate)
+        // 正確な日付がリストに存在するかを優先して探す
+        if let match = manager.upcomingGrouped.first(where: { cal.isDate($0.date, inSameDayAs: day) }) {
+            let id = "hdr_\(match.date.timeIntervalSince1970)"
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0))
+                }
+            } else {
+                proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0))
+            }
+            return
+        }
+        // 存在しない場合は従来の挙動で最も近い日へ
         let target = manager.upcomingGrouped.map(\.date).first {
-            Calendar.current.startOfDay(for: $0) >= Calendar.current.startOfDay(for: targetDate)
+            cal.startOfDay(for: $0) >= day
         } ?? manager.upcomingGrouped.first?.date
-        
         if let t = target {
             let id = "hdr_\(t.timeIntervalSince1970)"
-            // SwiftUI標準のバグ（少し見えているとスクロールしない）を回避するため、
-            // 確実な位置 UnitPoint(x: 0.5, y: 0) へ1発で指定する
             if animated {
                 withAnimation(.easeOut(duration: 0.2)) {
                     proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0))
@@ -604,9 +667,11 @@ struct MainCalendarView: View {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         editingEvent = newEv
         showInput = false
-        inputText = ""
-        inputSelectedDate = nil
-        liveParsedEvent = nil
+        openedFromInput = true
+        // NOTE: 入力画面の内容は消さない。キャンセルや下スワイプで戻ったときに復元できるようにする。
+        // inputText = ""
+        // inputSelectedDate = nil
+        // liveParsedEvent = nil
     }
 
     func submitInput() {
@@ -726,6 +791,7 @@ struct WeekdayRow: View {
 struct MonthPagerView: View {
     @EnvironmentObject var manager: CalendarManager
     @Binding var selectedDate: Date
+    @State private var isSnapping = false
 
     @State private var dragX: CGFloat = 0
     @State private var isHorizontalDrag = false
@@ -768,11 +834,14 @@ struct MonthPagerView: View {
                     .onEnded { v in
                         guard isHorizontalDrag else { return }
                         isHorizontalDrag = false
+                        guard !isSnapping else { return }
                         let vel = v.predictedEndTranslation.width
                         let dist = v.translation.width
                         if vel < -60 || dist < -40 {
+                            isSnapping = true
                             snapTo(direction: 1, width: w)
                         } else if vel > 60 || dist > 40 {
+                            isSnapping = true
                             snapTo(direction: -1, width: w)
                         } else {
                             withAnimation(.spring(response: 0.22, dampingFraction: 0.9)) { dragX = 0 }
@@ -785,18 +854,30 @@ struct MonthPagerView: View {
     /// direction: +1=次月, -1=前月
     func snapTo(direction: Int, width: CGFloat) {
         let capturedMonth = manager.displayedMonth // ★ 連続スワイプで月がズレないよう即時キャプチャ
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let monthsDiff = cal.dateComponents([.month], from: today, to: capturedMonth).month ?? 0
+        let limit = 24
+        // リミットを超えようとする場合はアニメーションだけ流して戻す
+        if (monthsDiff <= -limit && direction < 0) || (monthsDiff >= limit && direction > 0) {
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) { dragX = 0 }
+            isSnapping = false
+            return
+        }
+
         let targetX: CGFloat = direction > 0 ? -width : width
         withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) {
             dragX = targetX
         }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
+        let tentative = cal.date(byAdding: .month, value: direction, to: capturedMonth)!
+        manager.setDisplayedMonth(tentative)
+        manager.syncListToMonth = manager.displayedMonth
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            let cal = Calendar.current
-            let newMonth = cal.date(byAdding: .month, value: direction, to: capturedMonth)!
-            manager.displayedMonth = newMonth
-            manager.syncListToMonth = newMonth
             dragX = 0
+            isSnapping = false
         }
     }
 }
@@ -873,8 +954,15 @@ struct DayCell: View {
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
         .onTapGesture {
-            // 当月以外の日付をタップして勝手に月が遷移するのを防ぐ
-            guard isCurrentMonth else { return }
+            // 他月の日付をタップすると、自動でその月へ移動して選択も行う
+            if !isCurrentMonth {
+                let cal = Calendar.current
+                let newMonth = cal.date(from: cal.dateComponents([.year, .month], from: date))!
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    manager.setDisplayedMonth(newMonth)
+                }
+                manager.syncListToMonth = newMonth
+            }
             onTap()
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
@@ -1087,36 +1175,31 @@ struct BottomBar: View {
                     
                     // カレンダー選択日チップ（常時表示・タップでカレンダー再表示）
                     if let selDate = inputSelectedDate {
-                        HStack(spacing: 4) {
-                            Image(systemName: "calendar")
-                                .font(.system(size: 10, weight: .bold))
-                            Text(Self.mmddFmt.string(from: selDate))
-                                .font(.system(size: 12, weight: .bold))
-                            Text(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                 ? "を選択中　時間を入力してください" : "の予定")
-                                .font(.system(size: 11))
-                                .foregroundColor(.white.opacity(0.5))
-                            Spacer()
-                            Button {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    showCalendar = true
-                                }
-                            } label: {
-                                HStack(spacing: 2) {
-                                    Image(systemName: "calendar.badge.arrow.up")
-                                        .font(.system(size: 12, weight: .medium))
-                                    Text("変更")
-                                        .font(.system(size: 11, weight: .medium))
-                                }
-                                .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
+                        Button {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                showCalendar = true
                             }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "calendar")
+                                    .font(.system(size: 10, weight: .bold))
+                                Text(Self.mmddFmt.string(from: selDate))
+                                    .font(.system(size: 12, weight: .bold))
+                                Text(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                     ? "を選択中　時間を入力してください" : "の予定")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.5))
+                                Spacer()
+                                // 右端の“変更”ボタンは廃止
+                            }
+                            .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.12))
+                            .cornerRadius(6)
+                            .padding(.horizontal, 4)
                         }
-                        .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.12))
-                        .cornerRadius(6)
-                        .padding(.horizontal, 4)
+                        .buttonStyle(PlainButtonStyle())
                         .transition(.opacity)
                     }
 
@@ -1412,6 +1495,7 @@ struct EventEditSheet: View {
     @State private var isAllDay: Bool
     @State private var calendarId: String
     @State private var showDeleteConfirm = false // ★ 削除アラート用
+    @State private var showCancelAlert = false // キャンセル確認
 
     init(event: CalendarEvent) {
         self.event = event
@@ -1549,10 +1633,21 @@ struct EventEditSheet: View {
             .navigationTitle(navTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("キャンセル") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("キャンセル") {
+                        // 予定を捨てるか確認
+                        showCancelAlert = true
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") { save() }.fontWeight(.semibold)
                 }
+            }
+            .alert("編集中の予定を破棄しますか？", isPresented: $showCancelAlert) {
+                Button("残す", role: .cancel) {}
+                Button("破棄", role: .destructive) { dismiss() }
+            } message: {
+                Text("この操作は元に戻せません。")
             }
         }
     }
@@ -1594,6 +1689,8 @@ struct EventEditSheet: View {
                 notes: notes.isEmpty ? nil : notes,
                 isAllDay: isAllDay
             )
+            // 保存したことをメイン画面に通知（入力画面のリセット）
+            NotificationCenter.default.post(name: .init("EventSheetDidSaveNew"), object: nil)
         }
         dismiss()
     }

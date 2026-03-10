@@ -109,13 +109,16 @@ class NLPService {
         var parsedTimes: [(h: Int, m: Int)] = []
         var timeKeywords: [String] = []
         
-        let timePattern = #"([0-9]{1,2}):([0-9]{2})|([0-9]{1,2})時([0-9]{1,2})分|([0-9]{1,2})時半|([0-9]{1,2})時"#
+        // 時刻パターン。末尾に "間" や "時間" が続く場合は除外するため負の先読みを利用。
+        let timePattern = #"([0-9]{1,2}):([0-9]{2})|([0-9]{1,2})時([0-9]{1,2})分|([0-9]{1,2})時半|([0-9]{1,2})時(?!間)"#
         let timeRegex = try! NSRegularExpression(pattern: timePattern)
         let timeMatches = timeRegex.matches(in: normalizedText, range: NSRange(normalizedText.startIndex..., in: normalizedText))
         
         for match in timeMatches {
             guard let range = Range(match.range, in: normalizedText) else { continue }
             let matchStr = String(normalizedText[range])
+            // "4時間" のように "時間" を含む場合は時刻として扱わない
+            if matchStr.contains("時間") { continue }
             timeKeywords.append(matchStr)
             
             let nums = matchStr.components(separatedBy: CharacterSet.decimalDigits.inverted).filter { !$0.isEmpty }.compactMap { Int($0) }

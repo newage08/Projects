@@ -35,10 +35,27 @@ class CalendarManager: ObservableObject {
         }
     }
     /// 選択/表示中の月（カレンダー上部の月表示と連動）
-    @Published var displayedMonth: Date = Calendar.current.startOfDay(for: Date()) {
+    @Published private(set) var displayedMonth: Date = Calendar.current.startOfDay(for: Date()) {
         didSet {
             // 月が切り替わったら、その月の「月初め」をアンカーとしてリストに追加するためグループを再構築
             updateUpcomingGrouped()
+        }
+    }
+
+    // 表示月を変更する際はこのメソッドを経由し、不得意範囲にならないよう制限する
+    func setDisplayedMonth(_ month: Date) {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let diff = cal.dateComponents([.month], from: today, to: month).month ?? 0
+        let limit = 24 // +-2年まで
+        var clamped = month
+        if diff < -limit {
+            clamped = cal.date(byAdding: .month, value: -limit, to: today)!
+        } else if diff > limit {
+            clamped = cal.date(byAdding: .month, value: limit, to: today)!
+        }
+        if clamped != displayedMonth {
+            displayedMonth = clamped
         }
     }
     @Published var eventsByDay: [Date: [CalendarEvent]] = [:]
@@ -102,10 +119,16 @@ class CalendarManager: ObservableObject {
 
     func fetchEvents(for month: Date) async {
         guard !isFetching else { return }
+        // 遠方の月を要求されたら無視（無限スワイプ防止およびEventKit無応答対策）
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        if let diff = cal.dateComponents([.month], from: today, to: month).month,
+           abs(diff) > 24 {
+            return
+        }
         isFetching = true
         defer { isFetching = false }
         
-        let cal = Calendar.current
         guard let start = cal.date(from: cal.dateComponents([.year, .month], from: month)),
               let end = cal.date(byAdding: DateComponents(month: 1, day: 1), to: start)
         else { return }
@@ -139,6 +162,11 @@ class CalendarManager: ObservableObject {
             store.fetchReminders(matching: remPred) { reminders in
                 continuation.resume(returning: reminders ?? [])
             }
+        }
+
+        // 取得件数ゼロはEventKitの制限による可能性があるので既存データを保持して終了
+        if ekEvents.isEmpty && ekReminders.isEmpty {
+            return
         }
 
         // --- マッピング ---
