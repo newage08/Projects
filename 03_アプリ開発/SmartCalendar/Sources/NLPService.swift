@@ -117,7 +117,13 @@ class NLPService {
         for match in timeMatches {
             guard let range = Range(match.range, in: normalizedText) else { continue }
             let matchStr = String(normalizedText[range])
-            // "4時間" のように "時間" を含む場合は時刻として扱わない
+            // 後続文字が "間" のときは"4時間"由来と見なして除外
+            if let nextIdx = normalizedText.index(range.upperBound, offsetBy: 0, limitedBy: normalizedText.endIndex),
+               nextIdx < normalizedText.endIndex,
+               normalizedText[nextIdx] == "間" {
+                continue
+            }
+            // "4時間" のように "時間" を含む場合も除外
             if matchStr.contains("時間") { continue }
             timeKeywords.append(matchStr)
             
@@ -211,6 +217,8 @@ class NLPService {
         var title = text
         title = title.replacingOccurrences(of: #"[０-９0-9一二三四五六七八九十]{1,2}時半|[０-９0-9一二三四五六七八九十]{1,2}時[０-９0-9一二三四五六七八九十]{0,2}分?|[０-９0-9]{1,2}:[０-９0-9]{2}"#, with: " ", options: .regularExpression)
         title = title.replacingOccurrences(of: #"[０-９0-9一二三四五六七八九十]+(時間|h|分|m)(の|間)?"#, with: " ", options: .regularExpression)
+        // 末尾に "間" が残ってしまうケースを追加で除去
+        title = title.replacingOccurrences(of: #"([０-９0-9]+)(時間|h|分|m)間"#, with: " ", options: .regularExpression)
         title = title.replacingOccurrences(of: #"[０-９0-9]{1,2}[/\.月][０-９0-9]{1,2}(日)?"#, with: " ", options: .regularExpression)
             
         for kw in dayKeywords + locationKeywords {

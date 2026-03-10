@@ -254,7 +254,9 @@ struct MainCalendarView: View {
                         .font(.system(size: 150, weight: .black))
                         .foregroundColor(Color.white.opacity(0.09))
                         .allowsHitTesting(false)
-                        .allowsHitTesting(false)
+                        .minimumScaleFactor(0.1)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity)
                 }
             }
             .frame(height: calendarGridHeight, alignment: .top)
@@ -853,29 +855,27 @@ struct MonthPagerView: View {
 
     /// direction: +1=次月, -1=前月
     func snapTo(direction: Int, width: CGFloat) {
-        let capturedMonth = manager.displayedMonth // ★ 連続スワイプで月がズレないよう即時キャプチャ
+        let capturedMonth = manager.displayedMonth
         let cal = Calendar.current
+        // limit は同じ 10年にあわせる
         let today = cal.startOfDay(for: Date())
         let monthsDiff = cal.dateComponents([.month], from: today, to: capturedMonth).month ?? 0
-        let limit = 24
-        // リミットを超えようとする場合はアニメーションだけ流して戻す
+        let limit = 120
         if (monthsDiff <= -limit && direction < 0) || (monthsDiff >= limit && direction > 0) {
-            withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) { dragX = 0 }
+            withAnimation(.easeOut(duration: 0.12)) { dragX = 0 }
             isSnapping = false
             return
         }
 
         let targetX: CGFloat = direction > 0 ? -width : width
-        withAnimation(.spring(response: 0.22, dampingFraction: 0.88)) {
-            dragX = targetX
-        }
+        withAnimation(.easeOut(duration: 0.12)) { dragX = targetX }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
         let tentative = cal.date(byAdding: .month, value: direction, to: capturedMonth)!
         manager.setDisplayedMonth(tentative)
         manager.syncListToMonth = manager.displayedMonth
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
             dragX = 0
             isSnapping = false
         }

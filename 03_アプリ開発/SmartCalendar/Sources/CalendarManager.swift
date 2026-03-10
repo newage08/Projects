@@ -44,10 +44,13 @@ class CalendarManager: ObservableObject {
 
     // 表示月を変更する際はこのメソッドを経由し、不得意範囲にならないよう制限する
     func setDisplayedMonth(_ month: Date) {
+        // ユーザーが自由に過去未来を見られるよう、制限を10年 (120ヶ月) に拡大。
+        // それ以上移動しても表示自体は動くが、イベントフェッチは範囲外になるだけで
+        // 空白になるので実用上は十分。
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let diff = cal.dateComponents([.month], from: today, to: month).month ?? 0
-        let limit = 24 // +-2年まで
+        let limit = 120 // +-10年まで
         var clamped = month
         if diff < -limit {
             clamped = cal.date(byAdding: .month, value: -limit, to: today)!
@@ -119,13 +122,10 @@ class CalendarManager: ObservableObject {
 
     func fetchEvents(for month: Date) async {
         guard !isFetching else { return }
-        // 遠方の月を要求されたら無視（無限スワイプ防止およびEventKit無応答対策）
+        // 以前は24ヶ月以上を無視していたが、この制限は撤廃。
+        // カレンダー表示は自由に動かせるが、フェッチでは半年前前後の範囲のみを読み込む
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
-        if let diff = cal.dateComponents([.month], from: today, to: month).month,
-           abs(diff) > 24 {
-            return
-        }
         isFetching = true
         defer { isFetching = false }
         
