@@ -19,6 +19,8 @@ class NLPService {
     // MARK: - メイン解析メソッド（完全ローカル）
 
     func parse(text: String) -> ParsedEvent {
+        // 補助キーが挿入する「 : 」「 〜 」等のスペースを正規化（時刻パターンが壊れないよう）
+        let text = text.replacingOccurrences(of: #"\s*:\s*"#, with: ":", options: .regularExpression)
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
 
@@ -215,7 +217,7 @@ class NLPService {
 
         // ──── タイトル抽出 ────
         var title = text
-        title = title.replacingOccurrences(of: #"[０-９0-9一二三四五六七八九十]{1,2}時半|[０-９0-9一二三四五六七八九十]{1,2}時[０-９0-9一二三四五六七八九十]{0,2}分?|[０-９0-9]{1,2}:[０-９0-9]{2}"#, with: " ", options: .regularExpression)
+        title = title.replacingOccurrences(of: #"[０-９0-9一二三四五六七八九十]{1,2}時半|[０-９0-9一二三四五六七八九十]{1,2}時(?!間)[０-９0-9一二三四五六七八九十]{0,2}分?|[０-９0-9]{1,2}:[０-９0-9]{2}"#, with: " ", options: .regularExpression)
         title = title.replacingOccurrences(of: #"[０-９0-9一二三四五六七八九十]+(時間|h|分|m)(の|間)?"#, with: " ", options: .regularExpression)
         // 末尾に "間" が残ってしまうケースを追加で除去
         title = title.replacingOccurrences(of: #"([０-９0-9]+)(時間|h|分|m)間"#, with: " ", options: .regularExpression)

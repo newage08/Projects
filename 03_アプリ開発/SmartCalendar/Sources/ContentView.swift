@@ -220,11 +220,17 @@ struct MainCalendarView: View {
 
     // MARK: - View Builders
     
-    private var headerWatermarkText: String {
-        // 年月表示オフ時のウォーターマーク。年を含めることで文脈を失わない。
+    private var headerWatermarkYear: String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "ja_JP")
-        f.dateFormat = "yyyy年M月"
+        f.dateFormat = "yyyy年"
+        return f.string(from: manager.displayedMonth)
+    }
+
+    private var headerWatermarkMonth: String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "ja_JP")
+        f.dateFormat = "M"
         return f.string(from: manager.displayedMonth)
     }
 
@@ -250,13 +256,20 @@ struct MainCalendarView: View {
                     .environmentObject(manager)
                 // 年月非表示時の透かし（カレンダーグリッドの背面に月数字を大きく表示）
                 if !showHeaderYearMonth {
-                    Text(headerWatermarkText)
-                        .font(.system(size: 150, weight: .black))
-                        .foregroundColor(Color.white.opacity(0.09))
-                        .allowsHitTesting(false)
-                        .minimumScaleFactor(0.1)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity)
+                    VStack(spacing: 0) {
+                        Text(headerWatermarkYear)
+                            .font(.system(size: 22, weight: .black))
+                            .foregroundColor(Color.white.opacity(0.06))
+                            .allowsHitTesting(false)
+                            .lineLimit(1)
+                        Text(headerWatermarkMonth)
+                            .font(.system(size: 160, weight: .black))
+                            .foregroundColor(Color.white.opacity(0.09))
+                            .allowsHitTesting(false)
+                            .minimumScaleFactor(0.1)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
                 }
             }
             .frame(height: calendarGridHeight, alignment: .top)
@@ -353,20 +366,25 @@ struct MainCalendarView: View {
                 }
             } else {
                 // === リストのスクロール → カレンダーへの反映（単方向同期） ===
-                // 初回スクロール（今日へのジャンプ）が完了するまでは、スクロール位置による逆流（過去への無限フェッチ）を防止する
-                // ※過去へのスクロールで自動フェッチしないのは仕様（高速スクロール中の予期せぬ読み込みや
-                //   UIフリーズを避けるため）。ユーザーは「さらに過去を読み込む」ボタンで明示的に取得する。
-                guard !isSearching, hasInitiallyScrolled else { return }
-                // ユーザーがカレンダーを操作している最中（ジャンプ命令実行中）はスクロール反映をミュートする
+                // 🚨 無限スクロール防止：フェッチ中や、カレンダーからのジャンプ命令実行中はスクロール反映をミュートする
+                guard !isSearching, hasInitiallyScrolled, !manager.isFetching, !manager.isSearchFetching else { return }
                 guard selectedDateFromCalendar == nil else { return }
+                
                 // 画面上部（Y=0付近）にあるヘッダーを探す。
                 let targetOffsets = offsets.filter { $0.value <= 40 }
                 guard let (date, _) = targetOffsets.max(by: { $0.value < $1.value }) else { return }
                 let newDate = cal.startOfDay(for: date)
                 guard let newMonth = cal.date(from: cal.dateComponents([.year, .month], from: date)) else { return }
+                
                 if manager.displayedMonth != newMonth {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        manager.setDisplayedMonth(newMonth)
+                    // スクロールによる月変更はデバウンス的に扱うためにTaskを使用
+                    fetchMonthTask?.cancel() 
+                    fetchMonthTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 120_000_000) // 120ms待機
+                        guard !Task.isCancelled else { return }
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            manager.setDisplayedMonth(newMonth)
+                        }
                     }
                 }
                 if selectedDate != newDate {
@@ -440,9 +458,10 @@ struct MainCalendarView: View {
         } else {
             // 「さらに過去を読み込む」ボタン（上端）
             Button {
+                // searchTopDate は onPreferenceChange でビューポート最上部の日付をリアルタイム追跡済み
+                // ここでは上書きせず、そのまま復元位置として使う
                 let more = currentSearchYearsBack + 5
                 currentSearchYearsBack = more
-                // 既存データは保持したまま追加フェッチする
                 Task { await manager.fetchAllEventsForSearch(yearsBack: more) }
             } label: {
                 HStack(spacing: 6) {
@@ -481,6 +500,7 @@ struct MainCalendarView: View {
                         .padding(.vertical, 4)
                     }
                 }
+                .id("hdr_\(group.date.timeIntervalSince1970)")
             }
 
             // 検索結果の最下端マーカー（自動スクロール用）
@@ -794,16 +814,16 @@ struct MonthPagerView: View {
     @EnvironmentObject var manager: CalendarManager
     @Binding var selectedDate: Date
     @State private var isSnapping = false
-
-    @State private var dragX: CGFloat = 0
+    @State private var slotOffset: CGFloat = 0
     @State private var isHorizontalDrag = false
-    
-    // ★ 表示用の月（常に現在の manager.displayedMonth に基づき計算）
+    // ローカルで管理する表示月。manager.displayedMonth に依存せず @State で原子的に更新。
+    @State private var baseMonth: Date = Calendar.current.startOfDay(for: Date())
+
     private var displayMonths: [Date] {
         let cal = Calendar.current
-        let prev = cal.date(byAdding: .month, value: -1, to: manager.displayedMonth)!
-        let next = cal.date(byAdding: .month, value: 1, to: manager.displayedMonth)!
-        return [prev, manager.displayedMonth, next]
+        let prev = cal.date(byAdding: .month, value: -1, to: baseMonth)!
+        let next = cal.date(byAdding: .month, value: 1, to: baseMonth)!
+        return [prev, baseMonth, next]
     }
 
     var body: some View {
@@ -815,7 +835,6 @@ struct MonthPagerView: View {
                         month: displayMonths[i],
                         selectedDate: $selectedDate,
                         onDateSelected: { date in
-                            // 日付がタップされたら親（ContentView）の selectedDateFromCalendar を発火させるための口
                             NotificationCenter.default.post(name: .init("CalendarDateTapped"), object: date)
                         }
                     )
@@ -824,13 +843,14 @@ struct MonthPagerView: View {
                 }
             }
             .frame(width: w, alignment: .leading)
-            .offset(x: -w + dragX)
+            .offset(x: -w + slotOffset)
             .gesture(
                 DragGesture(minimumDistance: 8)
                     .onChanged { v in
+                        guard !isSnapping else { return }
                         if abs(v.translation.width) > abs(v.translation.height) || isHorizontalDrag {
                             isHorizontalDrag = true
-                            dragX = v.translation.width
+                            slotOffset = v.translation.width
                         }
                     }
                     .onEnded { v in
@@ -846,37 +866,41 @@ struct MonthPagerView: View {
                             isSnapping = true
                             snapTo(direction: -1, width: w)
                         } else {
-                            withAnimation(.spring(response: 0.22, dampingFraction: 0.9)) { dragX = 0 }
+                            withAnimation(.spring(response: 0.22, dampingFraction: 0.9)) { slotOffset = 0 }
                         }
                     }
             )
+        }
+        .onAppear { baseMonth = manager.displayedMonth }
+        .onChange(of: manager.displayedMonth) { month in
+            // 外部（今日ボタン等）からの月変更を反映（スナップ中は無視）
+            if !isSnapping { baseMonth = month }
         }
     }
 
     /// direction: +1=次月, -1=前月
     func snapTo(direction: Int, width: CGFloat) {
-        let capturedMonth = manager.displayedMonth
         let cal = Calendar.current
-        // limit は同じ 10年にあわせる
         let today = cal.startOfDay(for: Date())
-        let monthsDiff = cal.dateComponents([.month], from: today, to: capturedMonth).month ?? 0
+        let monthsDiff = cal.dateComponents([.month], from: today, to: baseMonth).month ?? 0
         let limit = 120
         if (monthsDiff <= -limit && direction < 0) || (monthsDiff >= limit && direction > 0) {
-            withAnimation(.easeOut(duration: 0.12)) { dragX = 0 }
+            withAnimation(.easeOut(duration: 0.12)) { slotOffset = 0 }
             isSnapping = false
             return
         }
 
         let targetX: CGFloat = direction > 0 ? -width : width
-        withAnimation(.easeOut(duration: 0.12)) { dragX = targetX }
+        let newMonth = cal.date(byAdding: .month, value: direction, to: baseMonth)!
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        withAnimation(.easeOut(duration: 0.12)) { slotOffset = targetX }
 
-        let tentative = cal.date(byAdding: .month, value: direction, to: capturedMonth)!
-        manager.setDisplayedMonth(tentative)
-        manager.syncListToMonth = manager.displayedMonth
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
-            dragX = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            // baseMonth と slotOffset を同一フレームで原子的に更新 → チラつき・ずれなし
+            baseMonth = newMonth
+            slotOffset = 0
+            manager.setDisplayedMonth(newMonth)
+            manager.syncListToMonth = newMonth
             isSnapping = false
         }
     }
@@ -929,10 +953,28 @@ struct DayCell: View {
     var isSelected: Bool { cal.isDate(date, inSameDayAs: selectedDate) }
     var isCurrentMonth: Bool { cal.isDate(date, equalTo: displayMonth, toGranularity: .month) }
     var dayEvents: [CalendarEvent] { manager.events(on: date) }
+    
+    // 選択された日付と同じ週かどうか（カレンダーの週ハイライト用）
+    var isInSelectedWeek: Bool {
+        let cal = Calendar.current
+        // 週の始まりの日付を比較して同一週か判定する
+        guard let startOfDateWeek = cal.dateInterval(of: .weekOfYear, for: date)?.start,
+              let startOfSelectedWeek = cal.dateInterval(of: .weekOfYear, for: selectedDate)?.start else {
+            return false
+        }
+        return cal.isDate(startOfDateWeek, inSameDayAs: startOfSelectedWeek)
+    }
 
     var body: some View {
         VStack(spacing: 2) {
             ZStack {
+                // 🚨 選択週のハイライト（薄いグレー）
+                if isInSelectedWeek && isCurrentMonth {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
                 if isSelected && !isToday {
                     Circle().fill(Color.white.opacity(0.18)).frame(width: 24, height: 24)
                 }
@@ -1040,35 +1082,37 @@ struct EventRow: View {
 
     var isPast: Bool { event.endDate < Date() }
 
+    @AppStorage("listCompactMode") private var listCompactMode = false
+
     var body: some View {
         Button {
             onTap()
         } label: {
-            HStack(spacing: 14) {
+            HStack(spacing: listCompactMode ? 10 : 14) {
                 ZStack {
                     Circle()
                         .fill(event.calendarColor.opacity(0.2))
-                        .frame(width: 40, height: 40)
+                        .frame(width: listCompactMode ? 32 : 40, height: listCompactMode ? 32 : 40)
                     Image(systemName: event.isReminder
                           ? (event.isCompleted ? "checkmark.circle.fill" : "circle")
                           : "calendar.circle.fill")
-                        .font(.system(size: 22))
+                        .font(.system(size: listCompactMode ? 18 : 22))
                         .foregroundColor(event.isReminder && event.isCompleted
                                          ? .white.opacity(0.3) : event.calendarColor)
                 }
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: listCompactMode ? 1 : 3) {
                     Text(event.title)
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(.system(size: listCompactMode ? 14 : 16, weight: .semibold))
                         .foregroundColor(event.isReminder && event.isCompleted ? .white.opacity(0.4) : .white)
                         .lineLimit(1)
                         .strikethrough(event.isReminder && event.isCompleted)
                     HStack(spacing: 8) {
                         Text(timeLabel)
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.system(size: listCompactMode ? 12 : 14, weight: .medium))
                             .foregroundColor(.white)
                         if let loc = event.location, !loc.isEmpty {
                             Label(loc, systemImage: "mappin.circle.fill")
-                                .font(.system(size: 11))
+                                .font(.system(size: listCompactMode ? 10 : 11))
                                 .foregroundColor(.white.opacity(0.45))
                                 .lineLimit(1)
                         }
@@ -1076,9 +1120,9 @@ struct EventRow: View {
                 }
                 Spacer()
             }
-            .padding(14)
+            .padding(listCompactMode ? 10 : 14)
             .background(
-                RoundedRectangle(cornerRadius: 14)
+                RoundedRectangle(cornerRadius: listCompactMode ? 10 : 14)
                     .fill(Color(red: 0.11, green: 0.11, blue: 0.12))
             )
             .opacity((isPast && !event.isReminder) ? 0.4 : 1.0)
@@ -1112,6 +1156,12 @@ struct BottomBar: View {
     let onSubmit: () -> Void
     let onLongPress: () -> Void
     let onSettingsTap: () -> Void
+    @AppStorage("inputShowDigits") private var inputShowDigits = true
+    @AppStorage("inputShowColon") private var inputShowColon = true
+    @AppStorage("inputShowTilde") private var inputShowTilde = true
+    @AppStorage("inputShowHours") private var inputShowHours = true
+    @AppStorage("inputShowMinutes") private var inputShowMinutes = true
+    @AppStorage("inputShowTemp") private var inputShowTemp = true
     @FocusState private var focused: Bool
 
     // 入力エリアで「詳細」ボタンから利用できるDateFormatter
@@ -1138,34 +1188,31 @@ struct BottomBar: View {
                 VStack(spacing: 4) {
                     if showInput {
                         VStack(spacing: 2) {
-                            // 数字キー（大きめ）
-                            HStack(spacing: 3) {
-                                ForEach(["1","2","3","4","5","6","7","8","9","0"], id: \.self) { char in
-                                    Button {
-                                        inputText += char
-                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                    } label: {
-                                        Text(char)
-                                            .font(.system(size: 19, weight: .semibold))
-                                            .foregroundColor(.white)
-                                            .frame(maxWidth: .infinity).frame(height: 32)
-                                            .background(Color.white.opacity(0.12)).cornerRadius(5)
-                                    }
-                                    .buttonStyle(DigitButtonStyle(char: char))
-                                }
+                            if inputShowDigits {
+                                SwipeDigitKeyRow(inputText: $inputText)
                             }
-                            // 単語キー
-                            HStack(spacing: 3) {
-                                ForEach([("時","時"),("分","分"),("〜","〜"),("時間","時間"),("分間","分間"),("仮"," 仮")], id: \.0) { char, insert in
-                                    Button {
-                                        inputText += insert
-                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                    } label: {
-                                        Text(char)
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundColor(char == "仮" ? Color.orange : .white.opacity(0.85))
-                                            .frame(maxWidth: .infinity).frame(height: 26)
-                                            .background(Color.white.opacity(0.09)).cornerRadius(5)
+                            let wordKeys: [(String, String, Bool)] = [
+                                (":", " : ", inputShowColon),
+                                ("〜", " 〜 ", inputShowTilde),
+                                ("時間", " 時間 ", inputShowHours),
+                                ("分間", " 分間 ", inputShowMinutes),
+                                ("仮", " 仮", inputShowTemp)
+                            ]
+                            let visibleWordKeys = wordKeys.filter(\.2)
+                            if !visibleWordKeys.isEmpty {
+                                HStack(spacing: 3) {
+                                    ForEach(visibleWordKeys, id: \.0) { char, insert, _ in
+                                        Button {
+                                            inputText += insert
+                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        } label: {
+                                            Text(char)
+                                                .font(.system(size: 13, weight: .medium))
+                                                .foregroundColor(char == "仮" ? Color.orange : .white.opacity(0.85))
+                                                .frame(maxWidth: .infinity).frame(height: 26)
+                                                .background(Color.white.opacity(0.09)).cornerRadius(5)
+                                        }
+                                        .buttonStyle(KeyButtonStyle())
                                     }
                                 }
                             }
@@ -1173,36 +1220,6 @@ struct BottomBar: View {
                         .padding(.horizontal, 4).padding(.top, 4)
                     }
                     
-                    // カレンダー選択日チップ（常時表示・タップでカレンダー再表示）
-                    if let selDate = inputSelectedDate {
-                        Button {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                showCalendar = true
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "calendar")
-                                    .font(.system(size: 10, weight: .bold))
-                                Text(Self.mmddFmt.string(from: selDate))
-                                    .font(.system(size: 12, weight: .bold))
-                                Text(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                     ? "を選択中　時間を入力してください" : "の予定")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.5))
-                                Spacer()
-                                // 右端の“変更”ボタンは廃止
-                            }
-                            .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.12))
-                            .cornerRadius(6)
-                            .padding(.horizontal, 4)
-                        }
-                        .buttonStyle(PlainButtonStyle())
-                        .transition(.opacity)
-                    }
-
                     // ✨ ライブプレビュー表示領域 ✨
                     if let parsed = liveParsedEvent, let start = parseFlexDateForLive(parsed.startDate), !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         HStack(spacing: 8) {
@@ -1232,6 +1249,7 @@ struct BottomBar: View {
                             if let loc = parsed.location, !loc.isEmpty {
                                 HStack(spacing: 2) {
                                     Image(systemName: "mappin")
+                                        .font(.system(size: 11, weight: .medium))
                                     Text(loc)
                                 }
                                 .font(.system(size: 11, weight: .medium))
@@ -1241,6 +1259,19 @@ struct BottomBar: View {
 
                             Spacer()
                         }
+                        .padding(.horizontal, 14)
+                        .padding(.top, 8)
+                        .transition(.opacity)
+                    } else if let selectedDate = inputSelectedDate, inputText.isEmpty {
+                        // ── 日付選択中ラベル（テキスト未入力時） ──
+                        HStack(spacing: 6) {
+                            Image(systemName: "calendar.badge.clock")
+                                .font(.system(size: 12, weight: .bold))
+                            Text("\(Self.mmddFmt.string(from: selectedDate)) を選択中")
+                                .font(.system(size: 13, weight: .bold))
+                            Spacer()
+                        }
+                        .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
                         .padding(.horizontal, 14)
                         .padding(.top, 8)
                         .transition(.opacity)
@@ -1479,6 +1510,75 @@ struct DigitButtonStyle: ButtonStyle {
     }
 }
 
+// MARK: - SwipeDigitKeyRow（スワイプで数字選択）
+
+struct SwipeDigitKeyRow: View {
+    @Binding var inputText: String
+    private let digits = ["1","2","3","4","5","6","7","8","9","0"]
+    @State private var hoveredIndex: Int? = nil
+
+    var body: some View {
+        GeometryReader { geo in
+            HStack(spacing: 3) {
+                ForEach(0..<digits.count, id: \.self) { i in
+                    Text(digits[i])
+                        .font(.system(size: hoveredIndex == i ? 24 : 19, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 32)
+                        .background(
+                            (hoveredIndex == i ? Color.white.opacity(0.25) : Color.white.opacity(0.12))
+                                .cornerRadius(5)
+                        )
+                        .overlay(alignment: .top) {
+                            if hoveredIndex == i {
+                                Text(digits[i])
+                                    .font(.system(size: 34, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(width: 48, height: 52)
+                                    .background(Color(red: 0.25, green: 0.35, blue: 0.55).cornerRadius(10))
+                                    .shadow(color: .black.opacity(0.45), radius: 8, y: 2)
+                                    .offset(y: -58)
+                            }
+                        }
+                        .animation(.easeOut(duration: 0.08), value: hoveredIndex)
+                        .zIndex(hoveredIndex == i ? 100 : 0)
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onChanged { v in
+                        let buttonWidth = geo.size.width / CGFloat(digits.count)
+                        let idx = min(max(Int(v.location.x / buttonWidth), 0), digits.count - 1)
+                        if hoveredIndex != idx {
+                            hoveredIndex = idx
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        }
+                    }
+                    .onEnded { _ in
+                        if let idx = hoveredIndex {
+                            inputText += digits[idx]
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        }
+                        hoveredIndex = nil
+                    }
+            )
+        }
+        .frame(height: 32)
+    }
+}
+
+// MARK: - KeyButtonStyle（補助キー押下時に拡大）
+
+struct KeyButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 1.2 : 1.0)
+            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+    }
+}
+
 // MARK: - イベント編集シート
 
 struct EventEditSheet: View {
@@ -1701,6 +1801,12 @@ struct EventEditSheet: View {
 struct SettingsView: View {
     @AppStorage("showHeaderYearMonth") private var showHeaderYearMonth = true
     @AppStorage("searchRangeYears") private var searchRangeYears = 3
+    @AppStorage("inputShowDigits") private var inputShowDigits = true
+    @AppStorage("inputShowColon") private var inputShowColon = true
+    @AppStorage("inputShowTilde") private var inputShowTilde = true
+    @AppStorage("inputShowHours") private var inputShowHours = true
+    @AppStorage("inputShowMinutes") private var inputShowMinutes = true
+    @AppStorage("inputShowTemp") private var inputShowTemp = true
     @EnvironmentObject var manager: CalendarManager
     @Environment(\.dismiss) private var dismiss
 
@@ -1714,6 +1820,10 @@ struct SettingsView: View {
                 // ── 表示設定 ──
                 Section {
                     Toggle("ヘッダーに年月を表示", isOn: $showHeaderYearMonth)
+                    Toggle("コンパクトなリスト表示", isOn: .init(
+                        get: { UserDefaults.standard.bool(forKey: "listCompactMode") },
+                        set: { UserDefaults.standard.set($0, forKey: "listCompactMode") }
+                    ))
                     if !showHeaderYearMonth {
                         Label("非表示時はカレンダーに薄く透かし表示されます", systemImage: "info.circle")
                             .font(.caption)
@@ -1745,6 +1855,21 @@ struct SettingsView: View {
                     }
                 } header: {
                     Text("入力")
+                }
+
+                // ── 補助キー設定 ──
+                Section {
+                    Toggle("数字キー（0〜9）", isOn: $inputShowDigits)
+                    Toggle("コロン（:）", isOn: $inputShowColon)
+                    Toggle("チルダ（〜）", isOn: $inputShowTilde)
+                    Toggle("時間", isOn: $inputShowHours)
+                    Toggle("分間", isOn: $inputShowMinutes)
+                    Toggle("仮", isOn: $inputShowTemp)
+                } header: {
+                    Text("補助キー（入力画面）")
+                } footer: {
+                    Text("非表示にした補助キーは入力画面に表示されません")
+                        .font(.caption)
                 }
 
                 // ── 検索設定 ──

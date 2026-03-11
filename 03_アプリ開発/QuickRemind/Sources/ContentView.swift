@@ -52,7 +52,6 @@ struct ContentView: View {
 
     @State private var localCompletedIDs: Set<String> = []
     @State private var localUncompletedIDs: Set<String> = []
-    @State private var completedReminderObjects: [String: EKReminder] = [:]
 
     @State private var hasAccessError = false
     @AppStorage("defaultHourOffset") private var defaultHourOffset = 6
@@ -60,7 +59,8 @@ struct ContentView: View {
     @AppStorage("selectedFont") private var selectedFont = "Futura-Bold"
     @AppStorage("defaultTimeMode") private var defaultTimeMode = "offset"  // "offset" or "fixed"
     @AppStorage("defaultFixedHour") private var defaultFixedHour = 19      // 0〜23
-    @AppStorage("defaultStartView") private var defaultStartView = "input"  // "input" or "list"
+    @AppStorage("defaultStartView") private var defaultStartView = "input"   // "input" or "list"
+    @AppStorage("defaultListIdentifier") private var defaultListIdentifier = ""
     @AppStorage("appColorScheme") private var appColorScheme = "dark"       // "dark", "light", "system"
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
     @Environment(\.colorScheme) private var systemColorScheme
@@ -81,6 +81,7 @@ struct ContentView: View {
     @State private var editingDate: Date = Date()
     @State private var isEditingDateEnabled: Bool = false
     @State private var showingEditSheet: Bool = false
+    @State private var showingDeleteConfirm = false
 
     // ドロップターゲット（ホバー）用
     @State private var hoveredTabId: String? = nil
@@ -337,7 +338,7 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 if !hasAccessError && viewState == .input { isTextFieldFocused = true }
             }
-        }) { SettingsView() }
+        }) { SettingsView(eventStore: eventStore) }
         .sheet(isPresented: $showDatePicker) {
             NavigationView {
                 VStack(spacing: 30) {
@@ -419,16 +420,42 @@ struct ContentView: View {
                             .onTapGesture { showDatePicker = true }
                         Group {
                             if viewState == .editingMinutes {
-                                TextField("0000", text: $minutesInputString)
-                                    .focused($isMinutesFocused)
-                                    .keyboardType(.numberPad)
-                                    .frame(width: 260)
-                                    .multilineTextAlignment(.center)
-                                    .onChange(of: minutesInputString) { v in
-                                        let digits = v.filter { $0.isNumber }
-                                        minutesInputString = String(digits.prefix(4))
+                                ZStack {
+                                    // 実際の入力フィールド（透明・カーソル非表示）
+                                    TextField("", text: $minutesInputString)
+                                        .focused($isMinutesFocused)
+                                        .keyboardType(.numberPad)
+                                        .foregroundColor(.clear)
+                                        .tint(.clear)
+                                        .onChange(of: minutesInputString) { v in
+                                            let digits = v.filter { $0.isNumber }
+                                            minutesInputString = String(digits.prefix(4))
+                                        }
+                                        .onSubmit { commitMinutes() }
+                                    // HH:MM 形式の表示オーバーレイ
+                                    let d = minutesInputString
+                                    let hh: String = {
+                                        switch d.count {
+                                        case 3:  return "0" + String(d.prefix(1))
+                                        case 4:  return String(d.prefix(2))
+                                        default: return "00"
+                                        }
+                                    }()
+                                    let mm: String = {
+                                        switch d.count {
+                                        case 0:  return "00"
+                                        case 1:  return "0" + d
+                                        case 2:  return d
+                                        default: return String(d.suffix(2))
+                                        }
+                                    }()
+                                    HStack(spacing: 0) {
+                                        Text(hh)
+                                        Text(":")
+                                        Text(mm)
                                     }
-                                    .onSubmit { commitMinutes() }
+                                    .allowsHitTesting(false)
+                                }
                             } else {
                                 HStack(spacing: 0) {
                                     Text(hourString(from: proposedTime))
@@ -666,7 +693,7 @@ struct ContentView: View {
 
                 Section {
                     Button(action: {
-                        deleteEditingReminder()
+                        showingDeleteConfirm = true
                     }) {
                         HStack {
                             Spacer()
@@ -675,6 +702,10 @@ struct ContentView: View {
                             Spacer()
                         }
                     }
+                }
+                .confirmationDialog("削除しますか？", isPresented: $showingDeleteConfirm, titleVisibility: .visible) {
+                    Button("削除", role: .destructive) { deleteEditingReminder() }
+                    Button("キャンセル", role: .cancel) {}
                 }
             }
             .navigationTitle("詳細の編集")
@@ -749,11 +780,9 @@ struct ContentView: View {
             if isDone(reminder) {
                 localCompletedIDs.remove(id); localUncompletedIDs.insert(id)
                 reminder.isCompleted = false
-                completedReminderObjects.removeValue(forKey: id)
             } else {
                 localUncompletedIDs.remove(id); localCompletedIDs.insert(id)
                 reminder.isCompleted = true
-                completedReminderObjects[id] = reminder
             }
         }
         try? eventStore.save(reminder, commit: true)
@@ -776,11 +805,11 @@ struct ContentView: View {
                 < ($1.alarms?.first?.absoluteDate ?? $1.dueDateComponents?.date ?? .distantFuture) }
             }
             DispatchQueue.main.async {
-                // 完了済みのリマインダーをmapに再注入（メインスレッドで@Stateへ安全にアクセス）
-                for (id, rm) in self.completedReminderObjects {
-                    let calId = rm.calendar.calendarIdentifier
-                    if !(map[calId]?.contains(where: { $0.calendarItemIdentifier == id }) ?? false) {
-                        map[calId, default: []].append(rm)
+                // ローカルで完了マークしたリマインダーを最新オブジェクトで再注入
+                for id in self.localCompletedIDs {
+                    if map.values.contains(where: { $0.contains(where: { $0.calendarItemIdentifier == id }) }) { continue }
+                    if let rm = self.eventStore.calendarItem(withIdentifier: id) as? EKReminder {
+                        map[rm.calendar.calendarIdentifier, default: []].append(rm)
                     }
                 }
                 self.remindersMap = map
@@ -901,7 +930,13 @@ struct ContentView: View {
                     DispatchQueue.main.async {
                         self.remindersMap = map
                         self.viewState = .list
-                        self.currentListIndex = 0
+                        // defaultListIdentifier に一致するカレンダーから始める
+                        if !self.defaultListIdentifier.isEmpty,
+                           let idx = cals.firstIndex(where: { $0.calendarIdentifier == self.defaultListIdentifier }) {
+                            self.currentListIndex = idx
+                        } else {
+                            self.currentListIndex = 0
+                        }
                         withAnimation(.easeIn(duration: 0.3)) { self.isReady = true }
                     }
                 }
@@ -1307,6 +1342,8 @@ struct TabDropDelegate: DropDelegate {
 }
 
 struct SettingsView: View {
+    let eventStore: EKEventStore
+
     @Environment(\.dismiss) var dismiss
     @AppStorage("defaultHourOffset") private var defaultHourOffset = 6
     @AppStorage("swipeHourOffset") private var swipeHourOffset = 1
@@ -1314,8 +1351,11 @@ struct SettingsView: View {
     @AppStorage("defaultTimeMode") private var defaultTimeMode = "offset"
     @AppStorage("defaultFixedHour") private var defaultFixedHour = 19
     @AppStorage("defaultStartView") private var defaultStartView = "input"
+    @AppStorage("defaultListIdentifier") private var defaultListIdentifier = ""
     @AppStorage("appColorScheme") private var appColorScheme = "dark"
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
+
+    @State private var availableCalendars: [EKCalendar] = []
 
     let availableFonts: [(name: String, label: String)] = [
         // 日本語フォント
@@ -1409,6 +1449,14 @@ struct SettingsView: View {
                         startViewButton(label: "リスト", value: "list")
                     }
                     .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    if defaultStartView == "list" && !availableCalendars.isEmpty {
+                        Picker("起動リスト", selection: $defaultListIdentifier) {
+                            Text("最初のリスト").tag("")
+                            ForEach(availableCalendars, id: \.calendarIdentifier) { cal in
+                                Text(cal.title).tag(cal.calendarIdentifier)
+                            }
+                        }
+                    }
                     Text("「リスト」にするとアプリ起動時に直接リスト画面が表示されます。")
                         .font(.footnote)
                         .foregroundColor(.secondary)
@@ -1459,6 +1507,7 @@ struct SettingsView: View {
             }
             .navigationTitle("設定")
             .navigationBarItems(trailing: Button("閉じる") { dismiss() })
+            .onAppear { availableCalendars = eventStore.calendars(for: .reminder) }
         }.preferredColorScheme(preferredScheme)
     }
 

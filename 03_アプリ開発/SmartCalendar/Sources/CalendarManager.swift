@@ -499,30 +499,33 @@ class CalendarManager: ObservableObject {
     }
 
     /// 全イベントリスト（日付グループ）
-    /// ※ 「予定がない日も表示する」元の仕様に戻しつつ、表示期間を前後6ヶ月に絞ることでラグを防止
+    /// ※ 「予定がない日も表示する」元の仕様に戻しつつ、表示期間を表示月（displayedMonth）の前後3ヶ月に絞ることでラグと無限ループを防止
     private func updateUpcomingGrouped() {
         let cal = Calendar.current
         var dict: [Date: [CalendarEvent]] = [:]
         
         let today = cal.startOfDay(for: Date())
-        let start = loadedStart.map { cal.startOfDay(for: $0) } ?? cal.date(byAdding: .month, value: -6, to: today)!
-        let end = loadedEnd.map { cal.startOfDay(for: $0) } ?? cal.date(byAdding: .month, value: 6, to: today)!
         
-        // 1. ロード期間内のすべての日付を空の配列で初期化（予定のない日も確保）
-        var current = start
-        while current <= end {
+        // 🚨 表示月を中心に前後3ヶ月分のみをリストに表示するように制限する（起動・スクロールの高速化とバグ防止）
+        guard let start = cal.date(byAdding: .month, value: -3, to: displayedMonth),
+              let end = cal.date(byAdding: .month, value: 3, to: displayedMonth) else { return }
+        
+        let startOfDay = cal.startOfDay(for: start)
+        let endOfDay = cal.startOfDay(for: end)
+        
+        // 1. 指定範囲内のすべての日付を空の配列で初期化（予定のない日も確保）
+        var current = startOfDay
+        while current <= endOfDay {
             dict[current] = []
             guard let next = cal.date(byAdding: .day, value: 1, to: current) else { break }
             current = next
         }
         
-        // 2. 実際のイベントを追加
+        // 2. 実際のイベントを追加（範囲外は無視）
         for ev in events {
             let key = cal.startOfDay(for: ev.startDate)
             if dict[key] != nil {
                 dict[key]?.append(ev)
-            } else {
-                dict[key] = [ev] // 範囲外のイベントがある場合の救済
             }
         }
         
