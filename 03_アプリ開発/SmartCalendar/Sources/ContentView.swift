@@ -33,6 +33,7 @@ struct MainCalendarView: View {
     
     @State private var showInput = false
     @State private var inputText = ""
+    @State private var inputWantsReminder = false
     @State private var liveParsedEvent: ParsedEvent? = nil
     @State private var pendingProgress: Double = 0.0
     @State private var openedFromInput = false
@@ -55,8 +56,14 @@ struct MainCalendarView: View {
     // 検索結果の自動スクロール制御用
     @State private var lastCachedSearchCount = 0
     @State private var searchTopDate: Date? = nil
+    @State private var pendingSearchRestoreDate: Date? = nil
     // 月変更フェッチのキャンセル用タスク
     @State private var fetchMonthTask: Task<Void, Never>? = nil
+    @State private var suppressListSyncUntil: Date = .distantPast
+    @State private var isProgrammaticListSync = false
+    @State private var isUserListDragging = false
+    @State private var endDragTask: Task<Void, Never>? = nil
+    @State private var isLoadingMoreSearch = false
 
     var body: some View {
         GeometryReader { _ in
@@ -91,6 +98,7 @@ struct MainCalendarView: View {
                         showInput: $showInput,
                         inputText: $inputText,
                         liveParsedEvent: $liveParsedEvent,
+                        inputWantsReminder: $inputWantsReminder,
                         isSearching: $isSearching,
                         showCalendar: $showCalendar,
                         inputSelectedDate: $inputSelectedDate,
@@ -121,7 +129,7 @@ struct MainCalendarView: View {
         }
         .sheet(item: $editingEvent, onDismiss: {
             // シートが閉じたときにリストを再フェッチ
-            Task { await manager.fetchEvents(for: manager.displayedMonth) }
+            Task { await manager.forceRefresh(for: manager.displayedMonth) }
             if openedFromInput {
                 // キャンセルや下スワイプなら入力画面に戻す
                 showInput = true
@@ -135,6 +143,7 @@ struct MainCalendarView: View {
                     inputText = ""
                     inputSelectedDate = nil
                     liveParsedEvent = nil
+                    inputWantsReminder = false
                     openedFromInput = false
                 }
         }
@@ -145,7 +154,7 @@ struct MainCalendarView: View {
             // ここのイベント取得は連続して呼ばれると重くなるためタスクをキャンセルしてデバウンス
             fetchMonthTask?.cancel()
             fetchMonthTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 120_000_000)
+                try? await Task.sleep(nanoseconds: 40_000_000)
                 guard !Task.isCancelled else { return }
                 await manager.fetchEvents(for: newMonth)
             }
@@ -173,6 +182,7 @@ struct MainCalendarView: View {
                 guard !Task.isCancelled else { return }
                 if newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     liveParsedEvent = nil
+                    inputWantsReminder = false
                 } else {
                     liveParsedEvent = NLPService.shared.parse(text: newVal)
                 }
@@ -341,6 +351,21 @@ struct MainCalendarView: View {
                 if isSearching { exitSearch() }
             }
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 4)
+                .onChanged { _ in
+                    endDragTask?.cancel()
+                    isUserListDragging = true
+                }
+                .onEnded { _ in
+                    endDragTask?.cancel()
+                    endDragTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 220_000_000)
+                        guard !Task.isCancelled else { return }
+                        isUserListDragging = false
+                    }
+                }
+        )
         .scrollIndicators(.hidden)
         .background(Color(red: 0.06, green: 0.06, blue: 0.08))
         .onAppear {
@@ -361,32 +386,32 @@ struct MainCalendarView: View {
             if isSearching {
                 // 検索モードでは、見えている最上部の日付を記録しておく
                 // 値は表示したいヘッダの日付を示す。
-                if let (date, y) = offsets.min(by: { abs($0.value) < abs($1.value) }) {
+                let nearTop = offsets
+                    .filter { $0.value >= -24 && $0.value <= 24 }
+                    .max(by: { $0.value < $1.value })
+                let nearestByDistance = offsets.min(by: { abs($0.value) < abs($1.value) })
+                if let (date, _) = nearTop ?? nearestByDistance {
                     searchTopDate = date
                 }
             } else {
                 // === リストのスクロール → カレンダーへの反映（単方向同期） ===
-                // 🚨 無限スクロール防止：フェッチ中や、カレンダーからのジャンプ命令実行中はスクロール反映をミュートする
-                guard !isSearching, hasInitiallyScrolled, !manager.isFetching, !manager.isSearchFetching else { return }
+                // 🚨 無限スクロール防止：検索中/初期化前/カレンダーからのジャンプ命令中はミュート
+                guard !isSearching, hasInitiallyScrolled, !manager.isSearchFetching else { return }
+                // 実ユーザードラッグ時のみ連動し、プログラムスクロール起因のループを防止
+                guard isUserListDragging else { return }
                 guard selectedDateFromCalendar == nil else { return }
+                guard !isProgrammaticListSync else { return }
+                guard manager.syncListToMonth == nil else { return }
+                guard Date() >= suppressListSyncUntil else { return }
                 
-                // 画面上部（Y=0付近）にあるヘッダーを探す。
-                let targetOffsets = offsets.filter { $0.value <= 40 }
-                guard let (date, _) = targetOffsets.max(by: { $0.value < $1.value }) else { return }
+                // 画面上部（Y=0）に最も近いヘッダーを採用（ジャンプ抑制）。
+                let nearTop = offsets.filter { $0.value >= -40 && $0.value <= 60 }
+                let nearest = nearTop.min(by: { abs($0.value) < abs($1.value) })
+                    ?? offsets.min(by: { abs($0.value) < abs($1.value) })
+                guard let (date, _) = nearest else { return }
                 let newDate = cal.startOfDay(for: date)
-                guard let newMonth = cal.date(from: cal.dateComponents([.year, .month], from: date)) else { return }
-                
-                if manager.displayedMonth != newMonth {
-                    // スクロールによる月変更はデバウンス的に扱うためにTaskを使用
-                    fetchMonthTask?.cancel() 
-                    fetchMonthTask = Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 120_000_000) // 120ms待機
-                        guard !Task.isCancelled else { return }
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                            manager.setDisplayedMonth(newMonth)
-                        }
-                    }
-                }
+                // ループ根絶のため、リストスクロールでは displayedMonth を更新しない。
+                // 月変更はカレンダー操作（スワイプ/日付タップ/今日）のみで行う。
                 if selectedDate != newDate {
                     selectedDate = newDate
                 }
@@ -394,13 +419,20 @@ struct MainCalendarView: View {
         }
         .onChange(of: selectedDateFromCalendar) { targetDate in
             guard let targetDate = targetDate, !isSearching else { return }
+            isProgrammaticListSync = true
             if selectedDate != targetDate { selectedDate = targetDate }
             scrollToSelected(proxy: proxy, targetDate: targetDate, animated: true)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if selectedDateFromCalendar == targetDate {
                     selectedDateFromCalendar = nil
                 }
+                isProgrammaticListSync = false
             }
+        }
+        .onChange(of: showCalendar) { _ in
+            // カレンダー表示切替直後はレイアウト再計算でオフセットが大きく揺れるため
+            // 一時的にリスト→月同期を停止して暴走スクロールを防ぐ。
+            suppressListSyncUntil = Date().addingTimeInterval(0.35)
         }
         .onChange(of: manager.resetTrigger) { _ in
             goToToday()
@@ -420,24 +452,29 @@ struct MainCalendarView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     withAnimation { proxy.scrollTo("search_bottom", anchor: .bottom) }
                 }
-            } else {
+            } else if isLoadingMoreSearch {
                 // 追加読み込み時はトップに記録した日付を復元
-                if let top = searchTopDate {
+                let restoreDate = pendingSearchRestoreDate ?? searchTopDate
+                if let top = restoreDate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        withAnimation { proxy.scrollTo("hdr_\(top.timeIntervalSince1970)", anchor: .top) }
+                        proxy.scrollTo("hdr_\(top.timeIntervalSince1970)", anchor: .top)
                     }
                 }
+                pendingSearchRestoreDate = nil
+                isLoadingMoreSearch = false
             }
             lastCachedSearchCount = newCount
         }
         .onChange(of: manager.syncListToMonth) { month in
             guard let month = month, !isSearching else { return }
+            isProgrammaticListSync = true
             if let proxy = listProxy {
                 scrollToSelected(proxy: proxy, targetDate: month, animated: false)
                 selectedDate = month
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 manager.syncListToMonth = nil
+                isProgrammaticListSync = false
             }
         }
     }
@@ -460,6 +497,8 @@ struct MainCalendarView: View {
             Button {
                 // searchTopDate は onPreferenceChange でビューポート最上部の日付をリアルタイム追跡済み
                 // ここでは上書きせず、そのまま復元位置として使う
+                isLoadingMoreSearch = true
+                pendingSearchRestoreDate = searchTopDate
                 let more = currentSearchYearsBack + 5
                 currentSearchYearsBack = more
                 Task { await manager.fetchAllEventsForSearch(yearsBack: more) }
@@ -555,12 +594,16 @@ struct MainCalendarView: View {
         cachedSearchResults = []
         searchTask?.cancel()
         searchTask = nil
+        isLoadingMoreSearch = false
         showCalendar = true
         hasInitiallyScrolled = false // 再スクロールを許可
+        isProgrammaticListSync = true
+        suppressListSyncUntil = Date().addingTimeInterval(0.7)
 
         let today = Calendar.current.startOfDay(for: Date())
         if let thisMonth = Calendar.current.date(from: Calendar.current.dateComponents([.year, .month], from: today)) {
             manager.setDisplayedMonth(thisMonth)
+            manager.syncListToMonth = thisMonth
         }
 
         // 検索でメモリに溜まったイベントキャッシュを完全クリアして再取得
@@ -569,12 +612,18 @@ struct MainCalendarView: View {
             await manager.fetchEvents(for: manager.displayedMonth)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 selectedDateFromCalendar = today
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    isProgrammaticListSync = false
+                }
             }
         }
     }
 
     func handleSearchToggle(searching: Bool) {
         showCalendar = !searching
+        if searching {
+            isUserListDragging = false
+        }
         if searching {
             isSearchFocused = true
             currentSearchYearsBack = searchRangeYears
@@ -679,11 +728,13 @@ struct MainCalendarView: View {
             title: parsed.title,
             startDate: start,
             endDate: end,
-            calendar: cal,
+            calendar: inputWantsReminder
+                ? (manager.store.defaultCalendarForNewReminders() ?? manager.reminderCalendars.first ?? cal)
+                : cal,
             location: parsed.location,
             isAllDay: isAllDay,
             ekEvent: nil,
-            ekReminder: nil,
+            ekReminder: inputWantsReminder ? EKReminder(eventStore: manager.store) : nil,
             isCompleted: false
         )
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -701,6 +752,8 @@ struct MainCalendarView: View {
 
         inputText = ""; showInput = false
         liveParsedEvent = nil
+        let asReminder = inputWantsReminder
+        inputWantsReminder = false
         let baseInputDate = inputSelectedDate
         inputSelectedDate = nil
 
@@ -731,7 +784,16 @@ struct MainCalendarView: View {
             end = parsedEnd
         }
 
-        try? manager.addEvent(title: parsed.title, startDate: start, endDate: end, location: parsed.location, calendar: manager.selectedCalendar, isAllDay: isAllDay)
+        if asReminder {
+            try? manager.addReminder(
+                title: parsed.title,
+                dueDate: start,
+                location: parsed.location,
+                calendar: manager.store.defaultCalendarForNewReminders() ?? manager.reminderCalendars.first
+            )
+        } else {
+            try? manager.addEvent(title: parsed.title, startDate: start, endDate: end, location: parsed.location, calendar: manager.selectedCalendar, isAllDay: isAllDay)
+        }
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
@@ -883,7 +945,7 @@ struct MonthPagerView: View {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let monthsDiff = cal.dateComponents([.month], from: today, to: baseMonth).month ?? 0
-        let limit = 120
+        let limit = 36
         if (monthsDiff <= -limit && direction < 0) || (monthsDiff >= limit && direction > 0) {
             withAnimation(.easeOut(duration: 0.12)) { slotOffset = 0 }
             isSnapping = false
@@ -971,7 +1033,7 @@ struct DayCell: View {
                 // 🚨 選択週のハイライト（薄いグレー）
                 if isInSelectedWeek && isCurrentMonth {
                     Rectangle()
-                        .fill(Color.white.opacity(0.06))
+                        .fill(Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.13))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
 
@@ -1077,7 +1139,7 @@ struct EventRow: View {
     var timeLabel: String {
         if event.isAllDay { return "終日" }
         if event.isReminder { return Self.timeFormatter.string(from: event.startDate) }
-        return "\(Self.timeFormatter.string(from: event.startDate)) ~ \(Self.timeFormatter.string(from: event.endDate))"
+        return "\(Self.timeFormatter.string(from: event.startDate))〜\(Self.timeFormatter.string(from: event.endDate))"
     }
 
     var isPast: Bool { event.endDate < Date() }
@@ -1146,6 +1208,7 @@ struct BottomBar: View {
     @Binding var showInput: Bool
     @Binding var inputText: String
     @Binding var liveParsedEvent: ParsedEvent?
+    @Binding var inputWantsReminder: Bool
     @Binding var isSearching: Bool
     @Binding var showCalendar: Bool
     @Binding var inputSelectedDate: Date?
@@ -1157,11 +1220,11 @@ struct BottomBar: View {
     let onLongPress: () -> Void
     let onSettingsTap: () -> Void
     @AppStorage("inputShowDigits") private var inputShowDigits = true
-    @AppStorage("inputShowColon") private var inputShowColon = true
     @AppStorage("inputShowTilde") private var inputShowTilde = true
     @AppStorage("inputShowHours") private var inputShowHours = true
     @AppStorage("inputShowMinutes") private var inputShowMinutes = true
     @AppStorage("inputShowTemp") private var inputShowTemp = true
+    @AppStorage("inputShowTask") private var inputShowTask = true
     @FocusState private var focused: Bool
 
     // 入力エリアで「詳細」ボタンから利用できるDateFormatter
@@ -1182,6 +1245,16 @@ struct BottomBar: View {
         return nil
     }
 
+    private func openCalendarPickerFromInput() {
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+            showCalendar = true
+            focused = false
+            if let d = inputSelectedDate {
+                selectedDateFromCalendar = Calendar.current.startOfDay(for: d)
+            }
+        }
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             if showInput {
@@ -1192,10 +1265,10 @@ struct BottomBar: View {
                                 SwipeDigitKeyRow(inputText: $inputText)
                             }
                             let wordKeys: [(String, String, Bool)] = [
-                                (":", " : ", inputShowColon),
-                                ("〜", " 〜 ", inputShowTilde),
-                                ("時間", " 時間 ", inputShowHours),
-                                ("分間", " 分間 ", inputShowMinutes),
+                                ("時", "時", inputShowHours),
+                                ("分", "分", inputShowMinutes),
+                                ("〜", "〜", inputShowTilde),
+                                ("task", "", inputShowTask),
                                 ("仮", " 仮", inputShowTemp)
                             ]
                             let visibleWordKeys = wordKeys.filter(\.2)
@@ -1203,14 +1276,30 @@ struct BottomBar: View {
                                 HStack(spacing: 3) {
                                     ForEach(visibleWordKeys, id: \.0) { char, insert, _ in
                                         Button {
-                                            inputText += insert
+                                            if char == "task" {
+                                                inputWantsReminder.toggle()
+                                                if inputWantsReminder && !inputText.contains(" task") {
+                                                    inputText += " task"
+                                                }
+                                            } else {
+                                                inputText += insert
+                                            }
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                                         } label: {
                                             Text(char)
                                                 .font(.system(size: 13, weight: .medium))
-                                                .foregroundColor(char == "仮" ? Color.orange : .white.opacity(0.85))
+                                                .foregroundColor(
+                                                    char == "仮" ? Color.orange :
+                                                    char == "task" && inputWantsReminder ? Color(red: 0.2, green: 0.6, blue: 1.0) :
+                                                    .white.opacity(0.85)
+                                                )
                                                 .frame(maxWidth: .infinity).frame(height: 26)
-                                                .background(Color.white.opacity(0.09)).cornerRadius(5)
+                                                .background(
+                                                    char == "task" && inputWantsReminder
+                                                        ? Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.2)
+                                                        : Color.white.opacity(0.09)
+                                                )
+                                                .cornerRadius(5)
                                         }
                                         .buttonStyle(KeyButtonStyle())
                                     }
@@ -1224,20 +1313,26 @@ struct BottomBar: View {
                     if let parsed = liveParsedEvent, let start = parseFlexDateForLive(parsed.startDate), !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         HStack(spacing: 8) {
                             // 日付・時間ラベル
-                            HStack(spacing: 4) {
-                                Image(systemName: "clock")
-                                    .font(.system(size: 11, weight: .bold))
-                                // カレンダー選択日がある場合はその日付を優先
-                                let displayDate = inputSelectedDate ?? start
-                                let dStr = Self.mmddFmt.string(from: displayDate)
-                                let tStr = (parsed.isAllDay ?? false) ? "終日" : Self.timeFmt.string(from: start)
-                                Text("\(dStr) \(tStr)")
-                                    .font(.system(size: 13, weight: .bold))
+                            Button {
+                                openCalendarPickerFromInput()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "clock")
+                                        .font(.system(size: 11, weight: .bold))
+                                    // カレンダー選択日がある場合はその日付を優先
+                                    let displayDate = inputSelectedDate ?? start
+                                    let dStr = Self.mmddFmt.string(from: displayDate)
+                                    let tStr = (parsed.isAllDay ?? false) ? "終日" : Self.timeFmt.string(from: start)
+                                    Text("\(dStr)\(tStr)")
+                                        .font(.system(size: 13, weight: .bold))
+                                }
+                                .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.15))
+                                .cornerRadius(6)
                             }
-                            .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.15))
-                            .cornerRadius(6)
+                            .buttonStyle(.plain)
+                            .contentShape(Rectangle())
                             
                             // タイトル
                             Text(parsed.title)
@@ -1264,17 +1359,23 @@ struct BottomBar: View {
                         .transition(.opacity)
                     } else if let selectedDate = inputSelectedDate, inputText.isEmpty {
                         // ── 日付選択中ラベル（テキスト未入力時） ──
-                        HStack(spacing: 6) {
-                            Image(systemName: "calendar.badge.clock")
-                                .font(.system(size: 12, weight: .bold))
-                            Text("\(Self.mmddFmt.string(from: selectedDate)) を選択中")
-                                .font(.system(size: 13, weight: .bold))
-                            Spacer()
+                        Button {
+                            openCalendarPickerFromInput()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "calendar.badge.clock")
+                                    .font(.system(size: 12, weight: .bold))
+                                Text("\(Self.mmddFmt.string(from: selectedDate))を選択中")
+                                    .font(.system(size: 13, weight: .bold))
+                                Spacer()
+                            }
+                            .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
+                            .padding(.horizontal, 14)
+                            .padding(.top, 8)
+                            .transition(.opacity)
                         }
-                        .foregroundColor(Color(red: 0.2, green: 0.6, blue: 1.0))
-                        .padding(.horizontal, 14)
-                        .padding(.top, 8)
-                        .transition(.opacity)
+                        .buttonStyle(.plain)
+                        .contentShape(Rectangle())
                     }
 
                     // 入力ボックス本体
@@ -1299,6 +1400,7 @@ struct BottomBar: View {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         showInput = false; inputText = ""; focused = false
                         inputSelectedDate = nil
+                        inputWantsReminder = false
                     }
                 } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -1357,6 +1459,7 @@ struct BottomBar: View {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                             showInput = true
                             showCalendar = true
+                            inputWantsReminder = false
                             // 明示タップ日 > 現在の選択日 の優先順で初期日付を設定
                             inputSelectedDate = selectedDateFromCalendar ?? currentSelectedDate
                         }
@@ -1405,7 +1508,7 @@ struct ParsedEventCard: View {
                 let f = DateFormatter(); f.locale = Locale(identifier: "ja_JP")
                 f.dateFormat = Calendar.current.isDateInToday(s) ? "'今日'" :
                                Calendar.current.isDateInTomorrow(s) ? "'明日'" : "M月d日"
-                return f.string(from: s) + " 終日"
+                return f.string(from: s) + "終日"
             }
         }
         let df = DateFormatter()
@@ -1414,8 +1517,8 @@ struct ParsedEventCard: View {
             df.dateFormat = fmt
             if let s = df.date(from: event.startDate) {
                 let f = DateFormatter(); f.locale = Locale(identifier: "ja_JP")
-                f.dateFormat = Calendar.current.isDateInToday(s) ? "今日 HH:mm" :
-                               Calendar.current.isDateInTomorrow(s) ? "明日 HH:mm" : "M月d日 HH:mm"
+                f.dateFormat = Calendar.current.isDateInToday(s) ? "今日HH:mm" :
+                               Calendar.current.isDateInTomorrow(s) ? "明日HH:mm" : "M月d日HH:mm"
                 return f.string(from: s)
             }
         }
@@ -1767,7 +1870,8 @@ struct EventEditSheet: View {
             try? manager.store.save(ek, span: .thisEvent, commit: true)
         } else if let rem = event.ekReminder {
             rem.title = title.isEmpty ? "(無題)" : title
-            let comp = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: startDate)
+            var comp = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: startDate)
+            comp.timeZone = .current
             rem.dueDateComponents = comp
             rem.location = location.isEmpty ? nil : location
             rem.url = URL(string: url.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -1792,6 +1896,7 @@ struct EventEditSheet: View {
             // 保存したことをメイン画面に通知（入力画面のリセット）
             NotificationCenter.default.post(name: .init("EventSheetDidSaveNew"), object: nil)
         }
+        Task { await manager.forceRefresh(for: manager.displayedMonth) }
         dismiss()
     }
 }
@@ -1802,11 +1907,11 @@ struct SettingsView: View {
     @AppStorage("showHeaderYearMonth") private var showHeaderYearMonth = true
     @AppStorage("searchRangeYears") private var searchRangeYears = 3
     @AppStorage("inputShowDigits") private var inputShowDigits = true
-    @AppStorage("inputShowColon") private var inputShowColon = true
     @AppStorage("inputShowTilde") private var inputShowTilde = true
     @AppStorage("inputShowHours") private var inputShowHours = true
     @AppStorage("inputShowMinutes") private var inputShowMinutes = true
     @AppStorage("inputShowTemp") private var inputShowTemp = true
+    @AppStorage("inputShowTask") private var inputShowTask = true
     @EnvironmentObject var manager: CalendarManager
     @Environment(\.dismiss) private var dismiss
 
@@ -1860,10 +1965,10 @@ struct SettingsView: View {
                 // ── 補助キー設定 ──
                 Section {
                     Toggle("数字キー（0〜9）", isOn: $inputShowDigits)
-                    Toggle("コロン（:）", isOn: $inputShowColon)
                     Toggle("チルダ（〜）", isOn: $inputShowTilde)
-                    Toggle("時間", isOn: $inputShowHours)
-                    Toggle("分間", isOn: $inputShowMinutes)
+                    Toggle("時", isOn: $inputShowHours)
+                    Toggle("分", isOn: $inputShowMinutes)
+                    Toggle("task（リマインド）", isOn: $inputShowTask)
                     Toggle("仮", isOn: $inputShowTemp)
                 } header: {
                     Text("補助キー（入力画面）")

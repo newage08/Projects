@@ -35,22 +35,17 @@ class CalendarManager: ObservableObject {
         }
     }
     /// 選択/表示中の月（カレンダー上部の月表示と連動）
-    @Published private(set) var displayedMonth: Date = Calendar.current.startOfDay(for: Date()) {
-        didSet {
-            // 月が切り替わったら、その月の「月初め」をアンカーとしてリストに追加するためグループを再構築
-            updateUpcomingGrouped()
-        }
-    }
+    @Published private(set) var displayedMonth: Date = Calendar.current.startOfDay(for: Date())
 
     // 表示月を変更する際はこのメソッドを経由し、不得意範囲にならないよう制限する
-    func setDisplayedMonth(_ month: Date) {
-        // ユーザーが自由に過去未来を見られるよう、制限を10年 (120ヶ月) に拡大。
+    func setDisplayedMonth(_ month: Date, updateGroups: Bool = true) {
+        // ユーザー体験上の暴走スクロールを避けるため、制限を3年 (36ヶ月) に抑える。
         // それ以上移動しても表示自体は動くが、イベントフェッチは範囲外になるだけで
         // 空白になるので実用上は十分。
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let diff = cal.dateComponents([.month], from: today, to: month).month ?? 0
-        let limit = 120 // +-10年まで
+        let limit = 36 // +-3年まで
         var clamped = month
         if diff < -limit {
             clamped = cal.date(byAdding: .month, value: -limit, to: today)!
@@ -59,6 +54,10 @@ class CalendarManager: ObservableObject {
         }
         if clamped != displayedMonth {
             displayedMonth = clamped
+            if updateGroups {
+                // 月が切り替わったら、その月の「月初め」をアンカーとしてリストに追加するためグループを再構築
+                updateUpcomingGrouped()
+            }
         }
     }
     @Published var eventsByDay: [Date: [CalendarEvent]] = [:]
@@ -133,8 +132,7 @@ class CalendarManager: ObservableObject {
               let end = cal.date(byAdding: DateComponents(month: 1, day: 1), to: start)
         else { return }
 
-        // 初期フェッチやスクロールごとに、表示月の「前後6ヶ月（計1年分）」のデータを超高速にロードします。
-        // これによりスクロールの途切れを防ぎつつ、メインスレッドのUIフリーズを回避します。
+        // 狭すぎる取得範囲は「予定が消えた」ように見えるため、前後6ヶ月へ戻す。
         let reqStart = cal.date(byAdding: .month, value: -6, to: start) ?? start
         let reqEnd = cal.date(byAdding: .month, value: 6, to: start) ?? end
 
@@ -279,6 +277,52 @@ class CalendarManager: ObservableObject {
         }
     }
 
+    func addReminder(
+        title: String,
+        dueDate: Date,
+        location: String?,
+        notes: String? = nil,
+        calendar: EKCalendar? = nil
+    ) throws {
+        let rem = EKReminder(eventStore: store)
+        rem.title = title
+        rem.location = location
+        rem.notes = notes
+        rem.isCompleted = false
+        rem.calendar = calendar
+            ?? store.defaultCalendarForNewReminders()
+            ?? reminderCalendars.first
+
+        let cal = Calendar.current
+        var comps = cal.dateComponents([.year, .month, .day, .hour, .minute], from: dueDate)
+        comps.timeZone = .current
+        rem.dueDateComponents = comps
+
+        try store.save(rem, commit: true)
+
+        let d = cal.startOfDay(for: dueDate)
+        let newReminder = CalendarEvent(
+            id: "\(rem.calendarItemIdentifier)_\(dueDate.timeIntervalSince1970)",
+            title: title,
+            startDate: dueDate,
+            endDate: dueDate,
+            calendar: rem.calendar,
+            location: location,
+            isAllDay: comps.hour == nil,
+            ekEvent: nil,
+            ekReminder: rem,
+            isCompleted: false
+        )
+
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            events.append(newReminder)
+            events.sort { $0.startDate < $1.startDate }
+            eventsByDay[d, default: []].append(newReminder)
+            eventsByDay[d]?.sort { $0.startDate < $1.startDate }
+            updateUpcomingGrouped()
+        }
+    }
+
     // MARK: - イベント削除
 
     func deleteEvent(_ event: CalendarEvent) throws {
@@ -303,6 +347,17 @@ class CalendarManager: ObservableObject {
         loadedStart = nil
         loadedEnd = nil
         upcomingGrouped = []
+    }
+
+    /// 編集保存後など、必ず最新データへ更新したいケース用の強制リフレッシュ。
+    /// 進行中フェッチの直後に取りこぼしなく再取得する。
+    func forceRefresh(for month: Date? = nil) async {
+        let anchor = month ?? displayedMonth
+        while isFetching {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        resetEventCache()
+        await fetchEvents(for: anchor)
     }
 
     /// 検索用に広い範囲のイベントを取得する（yearsBack=99で最大30年）
@@ -506,29 +561,38 @@ class CalendarManager: ObservableObject {
         
         let today = cal.startOfDay(for: Date())
         
-        // 🚨 表示月を中心に前後3ヶ月分のみをリストに表示するように制限する（起動・スクロールの高速化とバグ防止）
+        // 狭すぎる表示範囲は既存予定が消える体験につながるため、前後3ヶ月へ戻す。
         guard let start = cal.date(byAdding: .month, value: -3, to: displayedMonth),
               let end = cal.date(byAdding: .month, value: 3, to: displayedMonth) else { return }
         
         let startOfDay = cal.startOfDay(for: start)
         let endOfDay = cal.startOfDay(for: end)
         
-        // 1. 指定範囲内のすべての日付を空の配列で初期化（予定のない日も確保）
+        // 1. 指定範囲内のすべての日付を空の配列で初期化（スクロール位置の安定化）
         var current = startOfDay
         while current <= endOfDay {
             dict[current] = []
             guard let next = cal.date(byAdding: .day, value: 1, to: current) else { break }
             current = next
         }
-        
+
         // 2. 実際のイベントを追加（範囲外は無視）
         for ev in events {
             let key = cal.startOfDay(for: ev.startDate)
-            if dict[key] != nil {
-                dict[key]?.append(ev)
+            if key >= startOfDay && key <= endOfDay {
+                dict[key, default: []].append(ev)
             }
         }
+
+        // 3. アンカー日の補完
+        dict[today] = dict[today] ?? []
+        if let monthAnchor = cal.date(from: cal.dateComponents([.year, .month], from: displayedMonth)),
+           monthAnchor >= startOfDay, monthAnchor <= endOfDay {
+            dict[monthAnchor] = dict[monthAnchor] ?? []
+        }
         
-        upcomingGrouped = dict.keys.sorted().map { (date: $0, events: dict[$0]!) }
+        upcomingGrouped = dict.keys.sorted().map { d in
+            (date: d, events: (dict[d] ?? []).sorted { $0.startDate < $1.startDate })
+        }
     }
 }
