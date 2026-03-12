@@ -39,13 +39,13 @@ class CalendarManager: ObservableObject {
 
     // 表示月を変更する際はこのメソッドを経由し、不得意範囲にならないよう制限する
     func setDisplayedMonth(_ month: Date, updateGroups: Bool = true) {
-        // ユーザーが自由に過去未来を見られるよう、制限を10年 (120ヶ月) に拡大。
+        // ユーザー体験上の暴走スクロールを避けるため、制限を3年 (36ヶ月) に抑える。
         // それ以上移動しても表示自体は動くが、イベントフェッチは範囲外になるだけで
         // 空白になるので実用上は十分。
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let diff = cal.dateComponents([.month], from: today, to: month).month ?? 0
-        let limit = 120 // +-10年まで
+        let limit = 36 // +-3年まで
         var clamped = month
         if diff < -limit {
             clamped = cal.date(byAdding: .month, value: -limit, to: today)!
@@ -132,10 +132,9 @@ class CalendarManager: ObservableObject {
               let end = cal.date(byAdding: DateComponents(month: 1, day: 1), to: start)
         else { return }
 
-        // 表示月の「前後3ヶ月（計半年強）」に読み込み範囲を縮小して体感速度を優先。
-        // 画面遷移の重さ・起動直後のもたつきを軽減する。
-        let reqStart = cal.date(byAdding: .month, value: -3, to: start) ?? start
-        let reqEnd = cal.date(byAdding: .month, value: 3, to: start) ?? end
+        // 狭すぎる取得範囲は「予定が消えた」ように見えるため、前後6ヶ月へ戻す。
+        let reqStart = cal.date(byAdding: .month, value: -6, to: start) ?? start
+        let reqEnd = cal.date(byAdding: .month, value: 6, to: start) ?? end
 
         // 今回要求されている範囲がすでに取り込み済み（包含）ならスキップ
         if let ls = loadedStart, let le = loadedEnd, reqStart >= ls && reqEnd <= le {
@@ -562,9 +561,9 @@ class CalendarManager: ObservableObject {
         
         let today = cal.startOfDay(for: Date())
         
-        // 🚨 表示月を中心に前後2ヶ月分に縮小（起動・遷移の軽量化）
-        guard let start = cal.date(byAdding: .month, value: -2, to: displayedMonth),
-              let end = cal.date(byAdding: .month, value: 2, to: displayedMonth) else { return }
+        // 狭すぎる表示範囲は既存予定が消える体験につながるため、前後3ヶ月へ戻す。
+        guard let start = cal.date(byAdding: .month, value: -3, to: displayedMonth),
+              let end = cal.date(byAdding: .month, value: 3, to: displayedMonth) else { return }
         
         let startOfDay = cal.startOfDay(for: start)
         let endOfDay = cal.startOfDay(for: end)

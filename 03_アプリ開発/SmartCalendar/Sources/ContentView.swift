@@ -945,7 +945,7 @@ struct MonthPagerView: View {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let monthsDiff = cal.dateComponents([.month], from: today, to: baseMonth).month ?? 0
-        let limit = 120
+        let limit = 36
         if (monthsDiff <= -limit && direction < 0) || (monthsDiff >= limit && direction > 0) {
             withAnimation(.easeOut(duration: 0.12)) { slotOffset = 0 }
             isSnapping = false
